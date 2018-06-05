@@ -1,0 +1,12 @@
+highlighter: rouge
+permalink: /posts/:title.html
+
+title: DaleiZhou's Blog
+author:
+  name: DaleiZhou
+  email: tomhawstein@gmail.com
+  github: DaleiZhou
+
+production_url: http://daleizhou.github.io
+
+baseurl: /
