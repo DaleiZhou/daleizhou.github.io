@@ -19,8 +19,10 @@ KafkaProducer.sendOffsetsToTransaction() //发送offset到消费组协调者
 KafkaProducer.commitTransaction() // 提交事务
 KafkaProducer.abortTransaction() // 终止事务
 ```
+下面分别从客户端和服务端两个角度来看事务初始化过程。
 
-## initTransactions
+## KafkaProducer
+
 初始化事务时检查transactionManager，initTransactionsResult，如果initTransactionsResult为null(初始化过程中不为null)则修改状态并生成InitProducerIdRequest请求获取ProducerId和Epoch的值，用于事务交互过程中服务端进行事务处理。
 ```java
     public void initTransactions() {
@@ -62,51 +64,103 @@ public synchronized TransactionalRequestResult initializeTransactions() {
 Sender是KafkaProducer发送请求到与Kafka集群的后台线程，主要用于更新metadata和发送produce请求到合适的broker节点。run()方法循环调用run(long now)。
 
 ```java
+//Sender.java
 void run(long now) {
-        if (transactionManager != null) {
-            try {
-                if (transactionManager.shouldResetProducerStateAfterResolvingSequences())
-                    // Check if the previous run expired batches which requires a reset of the producer state.
-                    transactionManager.resetProducerId();
+        //other code...
 
-                if (!transactionManager.isTransactional()) {
-                    // this is an idempotent producer, so make sure we have a producer id
-                    maybeWaitForProducerId();
-                } else if (transactionManager.hasUnresolvedSequences() && !transactionManager.hasFatalError()) {
-                    transactionManager.transitionToFatalError(new KafkaException("The client hasn't received acknowledgment for " +
-                            "some previously sent messages and can no longer retry them. It isn't safe to continue."));
-                } else if (transactionManager.hasInFlightTransactionalRequest() || maybeSendTransactionalRequest(now)) {
-                    // as long as there are outstanding transactional requests, we simply wait for them to return
-                    client.poll(retryBackoffMs, now);
-                    return;
-                }
+        else if (transactionManager.hasInFlightTransactionalRequest() || maybeSendTransactionalRequest(now)) {
+            //在初始化阶段最重要的是maybeSendTransactionalRequest()方法，
+            //因为InitProducerIdRequest是需要发送到对应的Coordinator上(needsCoordinator() == true), 
+            //因此在发送请求之前需要保证节点缓存里有相应的值，如果没有则优先查找Coordinator
 
-                // do not continue sending if the transaction manager is in a failed state or if there
-                // is no producer id (for the idempotent case).
-                if (transactionManager.hasFatalError() || !transactionManager.hasProducerId()) {
-                    RuntimeException lastError = transactionManager.lastError();
-                    if (lastError != null)
-                        maybeAbortBatches(lastError);
-                    client.poll(retryBackoffMs, now);
-                    return;
-                } else if (transactionManager.hasAbortableError()) {
-                    accumulator.abortUndrainedBatches(transactionManager.lastError());
-                }
-            } catch (AuthenticationException e) {
-                // This is already logged as error, but propagated here to perform any clean ups.
-                log.trace("Authentication exception while processing transactional request: {}", e);
-                transactionManager.authenticationFailed(e);
-            }
+            // as long as there are outstanding transactional requests, we simply wait for them to return
+            client.poll(retryBackoffMs, now);
+            return;
         }
 
-        long pollTimeout = sendProducerData(now);
-        client.poll(pollTimeout, now);
+        // other code ...
     }
+
+    private boolean maybeSendTransactionalRequest(long now) {
+        if (transactionManager.isCompleting() && accumulator.hasIncomplete()) {
+            if (transactionManager.isAborting())
+                accumulator.abortUndrainedBatches(new KafkaException("Failing batch since transaction was aborted"));
+
+            if (!accumulator.flushInProgress())
+                accumulator.beginFlush();
+        }
+
+        //获取TransactionManager.pendingRequests队列中待处理的请求
+        //加入这时获取到之前的InitProducerIdRequest
+        TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.nextRequestHandler(accumulator.hasIncomplete());
+        if (nextRequestHandler == null)
+            return false;
+
+        AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
+        while (!forceClose) {
+            Node targetNode = null;
+            try {
+                //InitProducerIdRequest.needsCoordinator() == true
+                if (nextRequestHandler.needsCoordinator()) {
+                    targetNode = transactionManager.coordinator(nextRequestHandler.coordinatorType()); //TRANSACTIONcoordinatorType() == TRANSACTION
+                    if (targetNode == null) {
+                        transactionManager.lookupCoordinator(nextRequestHandler);
+                        break;
+                    }
+
+                    if (!NetworkClientUtils.awaitReady(client, targetNode, time, requestTimeout)) {
+                        transactionManager.lookupCoordinator(nextRequestHandler);
+                        break;
+                    }
+                } else {
+                    //重入这个方法后因为插入了FindCoordinatorRequest，但因为其不需要协调员，因此取一个正常能联通的node发送请求
+                    targetNode = awaitLeastLoadedNodeReady(requestTimeout);
+                }
+                //
+                if (targetNode != null) {
+                    if (nextRequestHandler.isRetry())
+                        time.sleep(nextRequestHandler.retryBackoffMs());
+
+                    ClientRequest clientRequest = client.newClientRequest(targetNode.idString(),
+                            requestBuilder, now, true, nextRequestHandler);
+                    transactionManager.setInFlightTransactionalRequestCorrelationId(clientRequest.correlationId());
+                    log.debug("Sending transactional request {} to node {}", requestBuilder, targetNode);
+
+                    client.send(clientRequest, now);
+                    return true;
+                }
+            } catch (IOException e) {
+                log.debug("Disconnect from {} while trying to send request {}. Going " +
+                        "to back off and retry", targetNode, requestBuilder);
+                if (nextRequestHandler.needsCoordinator()) {
+                    // We break here so that we pick up the FindCoordinator request immediately.
+                    transactionManager.lookupCoordinator(nextRequestHandler);
+                    break;
+                }
+            }
+
+            time.sleep(retryBackoffMs);
+            metadata.requestUpdate(); //如果执行到这里说明没有直接return出去，需要再次进行循环，这里更新metadata
+        }
+
+        transactionManager.retry(nextRequestHandler);
+        return true;
+    }    
 ```
+从源码上看出在maybeSendTransactionalRequest()方法中如果事务协调node为null或不是ready状态则在transactionManager.lookupCoordinator()中插入发送FindCoordinatorRequest请求，重入maybeSendTransactionalRequest方法后随便一个正常的node就可以进行查找事务协调节点。时限取出来的InitProducerIdRequest请求会重新放到发送队列中。再重入时会因为协调员存在而完成初始化ProducerId,Epoch的请求。
+FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionCoordinator用于Producer的事务处理。InitProducerIdHandler回调主要是更新本地ProducerId，epoch，并且修改事务状态为Ready。通过ProducerId，epoch就可以进行跨session的事务控制。
+
+至此客户端部分事务初始化介绍完毕。
+
+## KafkaApis
+
+事务初始化阶段Producer主要发送了FindCoordinatorRequest，InitProducerIdHandler来确定协调node和获取ProducerIdAndEpoch。
+
+### FindCoordinatorRequest处理
+
+### InitProducerIdHandler处理
 
 ## 总结
-
-
 
 ## References
 
