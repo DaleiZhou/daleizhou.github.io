@@ -102,7 +102,7 @@ void run(long now) {
         long pollTimeout = sendProducerData(now);
         client.poll(pollTimeout, now);
     }
-    ```
+```
 
 ## 总结
 
