@@ -60,6 +60,7 @@ public synchronized TransactionalRequestResult initializeTransactions() {
 ```
 
 Sender是KafkaProducer发送请求到与Kafka集群的后台线程，主要用于更新metadata和发送produce请求到合适的broker节点。run()方法循环调用run(long now)。
+
 ```java
 void run(long now) {
         if (transactionManager != null) {
@@ -107,7 +108,7 @@ void run(long now) {
 
 
 
-##References
+## References
 
 >https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
 
