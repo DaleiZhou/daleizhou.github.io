@@ -163,7 +163,9 @@ FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionC
 　　事务初始化阶段Producer主要发送了FindCoordinatorRequest，InitProducerIdHandler来确定协调node和获取ProducerIdAndEpoch。
 
 **FindCoordinatorRequest处理**
+
 　　发送客户端获取ProducerIdAndEpoch之前通过请求获得对应的Corrodinator,服务端处理处理逻辑的入口在KafkaApis中。下面看具体代码:
+
 ```scala
     //KafkaApis.scala
     def handle(request: RequestChannel.Request) {
@@ -227,6 +229,7 @@ FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionC
         }
     }
 ```
+
 　　总得说来过程大概归纳为下面几个步骤：
 　　　　1. 根据TransactionId做简单hash得到对应的partition
 　　　　2. 如果没有对应的topicmetadata,则创建出来
