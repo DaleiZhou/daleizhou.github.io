@@ -231,9 +231,10 @@ FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionC
 ```
 
 　　总得说来过程大概归纳为下面几个步骤：
-　　　　1. 根据TransactionId做简单hash得到对应的partition
-　　　　2. 如果没有对应的topicmetadata,则创建出来
-　　　　3. 根据metadata得到分区对应的leader,返回给客户端，或者返回COORDINATOR_NOT_AVAILABLE错误给客户端
+
+        1. 根据TransactionId做简单hash得到对应的partition
+        2. 如果没有对应的topicmetadata,则创建出来
+        3. 根据metadata得到分区对应的leader,返回给客户端，或者返回COORDINATOR_NOT_AVAILABLE错误给客户端
 
 **InitProducerIdHandler处理**
 
