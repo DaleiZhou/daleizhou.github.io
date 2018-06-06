@@ -497,8 +497,8 @@ KafkaProducer.abortTransaction() // 终止事务
 
 ## <a id="references">References</a>
 
->https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
->https://cwiki.apache.org/confluence/display/KAFKA/Idempotent+Producer
->https://cwiki.apache.org/confluence/display/KAFKA/Transactional+Messaging+in+Kafka
->http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
+* https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
+* https://cwiki.apache.org/confluence/display/KAFKA/Idempotent+Producer
+* https://cwiki.apache.org/confluence/display/KAFKA/Transactional+Messaging+in+Kafka
+* http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
 
