@@ -10,7 +10,9 @@ title: Kafka事务消息过程分析(一)
 　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。从消息的生产端保证了跨session的事务消息投递。这里计划从源码实现的角度跟踪分析，因为源码贴的太多，分大概三到四篇来说明。这里是第一篇：事务的初始化。
 
 ## <a id="baseApi">基本调用</a>
+
 　　从客户端角度而言，完整的事务使用一般有如下几个调用：
+
 ```java
 KafkaProducer.initTransactions() // 事务初始化
 KafkaProducer.beginTransaction() // 开始事务
@@ -463,8 +465,7 @@ KafkaProducer.abortTransaction() // 终止事务
               responseCallback(Errors.NOT_COORDINATOR)
               false
             } else {
-              // do not need to check the metadata object itself since no concurrent thread should be able to modify it
-              // under the same coordinator epoch, so directly append to txn log now
+              // 加锁之后不会更新metadata,因此如果epoch值是预期的，则append到事务日志中
               true
             }
           }
@@ -485,20 +486,19 @@ KafkaProducer.abortTransaction() // 终止事务
     }
   }
 
-
 ```
 
-## <a id="exceptionhandle">异常处理</a>
+　　在Replicamanager中appendRecords操作将MemoryRecords写入partition对应的leader中，并且等待其它副本的同步，当且ack数量满足条件或者超时立即调用callback，主从同步部分会有一个专门的章节介绍，这里先理解Kafka保证写入了leader和follow的事务日志中。
+
+　　至此，事务初始化服务器端部分介绍完毕。
 
 ## <a id="conclusion">总结</a>
+　　此篇为Kafka事务分析中的第一个部分，用户显示设置TransactionId，程序启动初始化事务时传入服务端，服务端根据这个id号做简单hash确定Coordinator。Producer和这个Coordinator交互获取ProducerIdAndEpoch，这个过程对用户是透明的。获取到的ProducerIdAndEpoch可以用于跨session的事务控制，具体的作用会在随后几篇博客中具体介绍。
 
 ## <a id="references">References</a>
 
 >https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
-
 >https://cwiki.apache.org/confluence/display/KAFKA/Idempotent+Producer
-
 >https://cwiki.apache.org/confluence/display/KAFKA/Transactional+Messaging+in+Kafka
-
 >http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
 
