@@ -55,7 +55,8 @@ title: Kafka事务消息过程分析(二)
             // other code ...
 
             //获取记录对应的partition，如果record中指定partition则使用，否则根据Partitioner计算得到
-            //Kafka的源码中提供了DefaultPartitioner，实现了partition()方法，具体过程就是根据Key, DefaultPartitioner维护的一个<topic, counter>计数器等数据简单的取模得到对应的partition
+            //Kafka的源码中提供了DefaultPartitioner，实现了partition()方法，具体过程就是根据Key, DefaultPartitioner
+            //维护的一个<topic, counter>计数器等数据简单的取模得到对应的partition
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
@@ -78,7 +79,7 @@ title: Kafka事务消息过程分析(二)
 　　KafkaProducer.doSend()方法在最后通过RecordAccumulator.append将消息放入RecordAccumulator中。RecordAccumulator类中通过ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches属性存储TopicPartition对应的batchs。batch放在双端队列中，是由于发送线程是从队首取数据进行发送，如果中途遇到异常则重新把batch塞回到队首，是一种容错的设计。
 
 ```java
-//RecordAccumulator.java
+    //RecordAccumulator.java
     public RecordAppendResult append(TopicPartition tp,
                                      long timestamp,
                                      byte[] key,
@@ -139,4 +140,4 @@ title: Kafka事务消息过程分析(二)
     }
 ```
 
-TBD
+## TBD
