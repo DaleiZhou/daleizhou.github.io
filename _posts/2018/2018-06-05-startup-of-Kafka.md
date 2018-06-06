@@ -278,8 +278,6 @@ KafkaProducer.abortTransaction() // 终止事务
       val producerId = producerIdManager.generateProducerId()
       responseCallback(InitProducerIdResult(producerId, producerEpoch = 0, Errors.NONE))
     } else if (transactionalId.isEmpty) {
-      // if transactional id is empty then return error as invalid request. This is
-      // to make TransactionCoordinator's behavior consistent with producer client
       responseCallback(initTransactionError(Errors.INVALID_REQUEST))
     } else if (!txnManager.validateTransactionTimeoutMs(transactionTimeoutMs)) {
       // check transactionTimeoutMs is not larger than the broker configured maximum allowed value
@@ -287,6 +285,7 @@ KafkaProducer.abortTransaction() // 终止事务
     } else {
       val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).right.flatMap {
         case None =>
+          //如果本地缓存里没有TransactionId对应的TransactionMeta数据则生成一个新的并更新缓存
           val producerId = producerIdManager.generateProducerId()
           val createdMetadata = new TransactionMetadata(transactionalId = transactionalId,
             producerId = producerId,
@@ -297,6 +296,7 @@ KafkaProducer.abortTransaction() // 终止事务
             txnLastUpdateTimestamp = time.milliseconds())
           txnManager.putTransactionStateIfNotExists(transactionalId, createdMetadata)
 
+        //如果本地缓存有则直接取出来
         case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
       }
 
@@ -306,6 +306,7 @@ KafkaProducer.abortTransaction() // 终止事务
           val txnMetadata = existingEpochAndMetadata.transactionMetadata
 
           txnMetadata.inLock {
+            //根据上述结果准备返回结果
             prepareInitProduceIdTransit(transactionalId, transactionTimeoutMs, coordinatorEpoch, txnMetadata)
           }
       }
@@ -349,10 +350,143 @@ KafkaProducer.abortTransaction() // 终止事务
     }
   }    
 
+  private def prepareInitProduceIdTransit(transactionalId: String,
+                                          transactionTimeoutMs: Int,
+                                          coordinatorEpoch: Int,
+                                          txnMetadata: TransactionMetadata): ApiResult[(Int, TxnTransitMetadata)] = {
+    if (txnMetadata.pendingTransitionInProgress) {
+      // return a retriable exception to let the client backoff and retry
+      Left(Errors.CONCURRENT_TRANSACTIONS)
+    } else {
+      // caller should have synchronized on txnMetadata already
+      txnMetadata.state match {
+        //other code ...
+
+        case CompleteAbort | CompleteCommit | Empty =>
+          //初次生成或者是已经完全结束时
+          //如果一个producerId对应的epoch耗尽则生成一个新的producerId，epoch重头开始
+          val transitMetadata = if (txnMetadata.isProducerEpochExhausted) {
+            val newProducerId = producerIdManager.generateProducerId()
+            txnMetadata.prepareProducerIdRotation(newProducerId, transactionTimeoutMs, time.milliseconds())
+          } else {
+            //否则根据沿用同一个producerId，但epoch自增1
+            txnMetadata.prepareIncrementProducerEpoch(transactionTimeoutMs, time.milliseconds())
+          }
+
+          Right(coordinatorEpoch, transitMetadata)
+
+        //other code ...
+      }
+    }
+  }
+
+  
+
 ```
+
 　　handleInitProducerId()中检查如果transactionalId为null,则在producerIdManager中获取一个递增的ProducerId,因为ProducerId是全局唯一的，但如果每次都和Zookeeper交互保证唯一性则效率比较低，因此Kafka解决的思路是每次获取一批id号用于分配，如果消耗光了再与Zookeeper交互重新获取一批。
 
+　　在handleInitProducerId()的最后，如果是正常情况下会调用txnManager.appendTransactionToLog()中将结果接入事务日志中。
 
+```scala
+  def appendTransactionToLog(transactionalId: String,
+                             coordinatorEpoch: Int,
+                             newMetadata: TxnTransitMetadata,
+                             responseCallback: Errors => Unit,
+                             retryOnError: Errors => Boolean = _ => false): Unit = {
+
+    // generate the message for this transaction metadata
+    val keyBytes = TransactionLog.keyToBytes(transactionalId)
+    val valueBytes = TransactionLog.valueToBytes(newMetadata)
+    val timestamp = time.milliseconds()
+
+    val records = MemoryRecords.withRecords(TransactionLog.EnforcedCompressionType, new SimpleRecord(timestamp, keyBytes, valueBytes))
+    val topicPartition = new TopicPartition(Topic.TRANSACTION_STATE_TOPIC_NAME, partitionFor(transactionalId))
+    val recordsPerPartition = Map(topicPartition -> records)
+
+    // set the callback function to update transaction status in cache after log append completed
+    //写入事务log之后调用的回调方法，用于更新内存中缓存的事务状态
+    def updateCacheCallback(responseStatus: collection.Map[TopicPartition, PartitionResponse]): Unit = {
+      
+      //other code ...
+
+      if (responseError == Errors.NONE) {
+        // 没有错误的情况下更新缓存，只修改需要改的地方，不需要整体更新，不需要锁将整个缓存锁起来
+        getTransactionState(transactionalId) match {
+          //other code ...
+          case Right(Some(epochAndMetadata)) =>
+            val metadata = epochAndMetadata.transactionMetadata
+
+            metadata.inLock {
+              if (epochAndMetadata.coordinatorEpoch != coordinatorEpoch) 
+                // other code ...
+                // 如果topicpartition迁移了则发送NOT_COORDINATOR用于客户端重试
+                responseError = Errors.NOT_COORDINATOR
+              } else {
+                // 更新缓存信息
+                metadata.completeTransitionTo(newMetadata)
+                debug(s"Updating $transactionalId's transaction state to $newMetadata with coordinator epoch $coordinatorEpoch for $transactionalId succeeded")
+              }
+            }
+
+          case Right(None) =>
+            // other code ...
+            // 客户端处理
+            responseError = Errors.NOT_COORDINATOR
+        }
+      } 
+
+      // other code ...
+
+      responseCallback(responseError)
+    }
+
+    inReadLock(stateLock) {
+      // 直到写本地事务日志结束才放锁,这是为了避免在check操作完成之后，
+      // appendRecords()操作完成之前发生了一个迁出迁入的完整过程使得更高的epoch写入到log中，就会导致appendRecords写入一个旧的epoch值，
+      // followes上的副本还可以复制，让事务日志处于一个不正常的状态
+ 
+      getTransactionState(transactionalId) match {
+        case Left(err) =>
+          responseCallback(err)
+
+        case Right(None) =>
+          // the coordinator metadata has been removed, reply to client immediately with NOT_COORDINATOR
+          responseCallback(Errors.NOT_COORDINATOR)
+
+        case Right(Some(epochAndMetadata)) =>
+          val metadata = epochAndMetadata.transactionMetadata
+
+          val append: Boolean = metadata.inLock {
+            if (epochAndMetadata.coordinatorEpoch != coordinatorEpoch) {
+              // the coordinator epoch has changed, reply to client immediately with NOT_COORDINATOR
+              responseCallback(Errors.NOT_COORDINATOR)
+              false
+            } else {
+              // do not need to check the metadata object itself since no concurrent thread should be able to modify it
+              // under the same coordinator epoch, so directly append to txn log now
+              true
+            }
+          }
+          if (append) {
+            //如果metadata里的epoch值与预期的一样则写入本地事务log中
+            replicaManager.appendRecords(
+                newMetadata.txnTimeoutMs.toLong,
+                TransactionLog.EnforcedRequiredAcks,
+                internalTopicsAllowed = true,
+                isFromClient = false,
+                recordsPerPartition,
+                updateCacheCallback,
+                delayedProduceLock = Some(stateLock.readLock))
+
+              // other code ...
+          }
+      }
+    }
+  }
+
+
+```
 
 ## <a id="exceptionhandle">异常处理</a>
 
