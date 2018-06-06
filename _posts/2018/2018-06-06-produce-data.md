@@ -19,11 +19,13 @@ title: Kafka事务消息过程分析(二)
         maybeFailWithError();
         transitionTo(State.IN_TRANSACTION); //READY -> IN_TRANSACTION
     }
-
 ```
 
 ## <a id="send">send()</a>
 
+　　KafkaProducer.send()方法实现生产消息的发送，发送的record不仅可以指定topic,还可以指定partition，即指定消息发到指定分区中。如果用户不提供则使用系统默认的根据一些参数通过简单取模的方式得到分区，这种取模的方式可以做到消息基本上均匀分布在各个分区上。
+
+　　在doSend()方法中只是把record放在消息累加器中。累加器中给每个topic-partition对应待发送数据的batch，达到一定条件才整体发送。之所以这么设计应该是为了减少网络通信次数，提高整体的运行效率。下面是具体代码的注释。
 
 ```java
     //KafkaProducer.java
@@ -71,5 +73,70 @@ title: Kafka事务消息过程分析(二)
 
         //other code ...
     }
-
 ```
+
+　　KafkaProducer.doSend()方法在最后通过RecordAccumulator.append将消息放入RecordAccumulator中。RecordAccumulator类中通过ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches属性存储TopicPartition对应的batchs。batch放在双端队列中，是由于发送线程是从队首取数据进行发送，如果中途遇到异常则重新把batch塞回到队首，是一种容错的设计。
+
+```java
+//RecordAccumulator.java
+    public RecordAppendResult append(TopicPartition tp,
+                                     long timestamp,
+                                     byte[] key,
+                                     byte[] value,
+                                     Header[] headers,
+                                     Callback callback,
+                                     long maxTimeToBlock) throws InterruptedException {
+        // We keep track of the number of appending thread to make sure we do not miss batches in
+        // abortIncompleteBatches().
+        appendsInProgress.incrementAndGet();
+        ByteBuffer buffer = null;
+        if (headers == null) headers = Record.EMPTY_HEADERS;
+        try {
+            // check if we have an in-progress batch
+            Deque<ProducerBatch> dq = getOrCreateDeque(tp); //取或者创建
+            synchronized (dq) {
+                if (closed)
+                    throw new IllegalStateException("Cannot send after the producer is closed.");
+                RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
+                //如果dq为null，返回appendResult = null，
+                if (appendResult != null)
+                    return appendResult;
+            }
+
+            // we don't have an in-progress record batch try to allocate a new batch
+            byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
+            log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
+            buffer = free.allocate(size, maxTimeToBlock);
+            synchronized (dq) {
+                // Need to check if producer is closed again after grabbing the dequeue lock.
+                if (closed)
+                    throw new IllegalStateException("Cannot send after the producer is closed.");
+
+                RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
+                if (appendResult != null) {
+                    // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
+                    return appendResult;
+                }
+
+                MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
+                ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
+                FutureRecordMetadata future = Utils.notNull(batch.tryAppend(timestamp, key, value, headers, callback, time.milliseconds()));
+
+                dq.addLast(batch);
+                incomplete.add(batch);
+
+                // Don't deallocate this buffer in the finally block as it's being used in the record batch
+                buffer = null;
+
+                return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true);
+            }
+        } finally {
+            if (buffer != null)
+                free.deallocate(buffer);
+            appendsInProgress.decrementAndGet();
+        }
+    }
+```
+
+TBD
