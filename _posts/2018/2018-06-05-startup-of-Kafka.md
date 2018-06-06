@@ -1,7 +1,7 @@
 ---
 layout: post
 category: Kafka
-title: Kafka事务消息过程分析
+title: Kafka事务消息过程分析(一)
 ---
 
 ## 内容 
@@ -163,6 +163,74 @@ FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionC
 　　事务初始化阶段Producer主要发送了FindCoordinatorRequest，InitProducerIdHandler来确定协调node和获取ProducerIdAndEpoch。
 
 **FindCoordinatorRequest处理**
+　　发送客户端获取ProducerIdAndEpoch之前通过请求获得对应的Corrodinator,服务端处理处理逻辑的入口在KafkaApis中。下面看具体代码:
+```scala
+    //KafkaApis.scala
+    def handle(request: RequestChannel.Request) {
+      //other code ...
+      request.header.apiKey match {
+        case ApiKeys.FIND_COORDINATOR => handleFindCoordinatorRequest(request)
+        case ApiKeys.INIT_PRODUCER_ID => handleInitProducerIdRequest(request)
+            } catch {
+      case e: FatalExitError => throw e
+      //other code...
+    }
+
+    def handleFindCoordinatorRequest(request: RequestChannel.Request) {
+        val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+
+        //other code..
+        else if (findCoordinatorRequest.coordinatorType == FindCoordinatorRequest.CoordinatorType.TRANSACTION &&
+            !authorize(request.session, Describe, new Resource(TransactionalId, findCoordinatorRequest.coordinatorKey))) //处理身份验证无法通过的分支
+          sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+        else {
+          // get metadata (and create the topic if necessary)
+          // 从请求中获取metadata,必要时需要创建topic
+          val (partition, topicMetadata) = findCoordinatorRequest.coordinatorType match {
+            // other code..
+            // 处理TRANSACTION查找Coordinator请求
+            case FindCoordinatorRequest.CoordinatorType.TRANSACTION =>
+              // 根据transactionalId通过简单的hash方式获取对应的分区：
+              // Utils.abs(transactionalId.hashCode) % transactionTopicPartitionCount 获取对应的分区
+              val partition = txnCoordinator.partitionFor(findCoordinatorRequest.coordinatorKey)
+              //获取或者创建metadata，内部的topic名为__transaction_state，
+              //用于保存各个TopicMetadata数据，包含Topic的分区信息，副本leader信息等
+              val metadata = getOrCreateInternalTopic(TRANSACTION_STATE_TOPIC_NAME, request.context.listenerName)
+              (partition, metadata)
+
+            //other code..
+          }
+
+          def createResponse(requestThrottleMs: Int): AbstractResponse = {
+            val responseBody = if (topicMetadata.error != Errors.NONE) {
+              new FindCoordinatorResponse(requestThrottleMs, Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
+            } else {
+              //为了保证一致性，kafka的消息生产者和消费者只与分区的leader交互
+              //从topicmetadata中根据由hash得到的分区得到对应的分区leader
+              val coordinatorEndpoint = topicMetadata.partitionMetadata.asScala
+                .find(_.partition == partition)
+                .map(_.leader)
+                .flatMap(p => Option(p))
+              //获取到endpoint如果正常则包装结果返回给客户端，否则设置error并返回给客户端
+              coordinatorEndpoint match {
+                case Some(endpoint) if !endpoint.isEmpty =>
+                  new FindCoordinatorResponse(requestThrottleMs, Errors.NONE, endpoint)
+                case _ =>
+                  new FindCoordinatorResponse(requestThrottleMs, Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
+              }
+            }
+            trace("Sending FindCoordinator response %s for correlation id %d to client %s."
+              .format(responseBody, request.header.correlationId, request.header.clientId))
+            responseBody
+          }
+        sendResponseMaybeThrottle(request, createResponse)
+        }
+    }
+```
+    总得说来过程大概归纳为下面几个不走：
+        1. 根据TransactionId做简单hash得到对应的partition
+        2. 如果没有对应的topicmetadata,则创建出来
+        3. 根据metadata得到分区对应的leader,返回给客户端，或者返回COORDINATOR_NOT_AVAILABLE错误给客户端
 
 **InitProducerIdHandler处理**
 
