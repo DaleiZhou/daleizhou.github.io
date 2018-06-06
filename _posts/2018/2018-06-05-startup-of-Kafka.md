@@ -7,7 +7,7 @@ title: Kafka事务消息过程分析(一)
 ## 内容 
 >Status: Draft
 
-　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。这里计划从源码实现的角度跟踪分析，因为源码贴的太多，分大概三到四篇来说明。这里是第一篇：事务的初始化。
+　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。从消息的生产端保证了跨session的事务消息投递。这里计划从源码实现的角度跟踪分析，因为源码贴的太多，分大概三到四篇来说明。这里是第一篇：事务的初始化。
 
 ## <a id="baseApi">基本调用</a>
 　　从客户端角度而言，完整的事务使用一般有如下几个调用：
@@ -237,7 +237,122 @@ KafkaProducer.abortTransaction() // 终止事务
         2. 如果没有对应的topicmetadata,则创建出来
         3. 根据metadata得到分区对应的leader,返回给客户端，或者返回COORDINATOR_NOT_AVAILABLE错误给客户端
 
-**InitProducerIdHandler处理**
+**InitProducerIdRequest处理**
+    
+　　服务端对InitProducerIdRequest的处理用于返回ProducerIdAndEpoch,用于事务的处理，处理的入口一样在KafkaApis的handle()方法中，下面看具体代码:
+
+```scala
+   //kafkaApis.scala
+
+   def handleInitProducerIdRequest(request: RequestChannel.Request): Unit = {
+    val initProducerIdRequest = request.body[InitProducerIdRequest]
+    val transactionalId = initProducerIdRequest.transactionalId
+    //other code ...
+
+    //回调发送结果，将InitProducerIdResult发送回客户端
+    def sendResponseCallback(result: InitProducerIdResult): Unit = {
+      def createResponse(requestThrottleMs: Int): AbstractResponse = {
+        val responseBody = new InitProducerIdResponse(requestThrottleMs, result.error, result.producerId, result.producerEpoch)
+        trace(s"Completed $transactionalId's InitProducerIdRequest with result $result from client ${request.header.clientId}.")
+        responseBody
+      }
+      sendResponseMaybeThrottle(request, createResponse)
+    }
+
+    txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.transactionTimeoutMs, sendResponseCallback)
+  }
+
+```
+
+　　KafkaApis中handleInitProducerIdRequest处理过程很简单，先进行身份验证等操作，通过调用txnCoordinator.handleInitProducerId()方法构造结果,并在这个方法里并通过sendResponseCallback()回调发送结果到客户端。
+
+```scala
+//TransactionCoordinator.scala
+  def handleInitProducerId(transactionalId: String,
+                           transactionTimeoutMs: Int,
+                           responseCallback: InitProducerIdCallback): Unit = {
+
+    if (transactionalId == null) {
+      // 如果Producer端未设置transactionalId则在producerIdManager批量id号里
+      // 获取一个ProducerId返回给客户端
+      val producerId = producerIdManager.generateProducerId()
+      responseCallback(InitProducerIdResult(producerId, producerEpoch = 0, Errors.NONE))
+    } else if (transactionalId.isEmpty) {
+      // if transactional id is empty then return error as invalid request. This is
+      // to make TransactionCoordinator's behavior consistent with producer client
+      responseCallback(initTransactionError(Errors.INVALID_REQUEST))
+    } else if (!txnManager.validateTransactionTimeoutMs(transactionTimeoutMs)) {
+      // check transactionTimeoutMs is not larger than the broker configured maximum allowed value
+      responseCallback(initTransactionError(Errors.INVALID_TRANSACTION_TIMEOUT))
+    } else {
+      val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).right.flatMap {
+        case None =>
+          val producerId = producerIdManager.generateProducerId()
+          val createdMetadata = new TransactionMetadata(transactionalId = transactionalId,
+            producerId = producerId,
+            producerEpoch = RecordBatch.NO_PRODUCER_EPOCH,
+            txnTimeoutMs = transactionTimeoutMs,
+            state = Empty,
+            topicPartitions = collection.mutable.Set.empty[TopicPartition],
+            txnLastUpdateTimestamp = time.milliseconds())
+          txnManager.putTransactionStateIfNotExists(transactionalId, createdMetadata)
+
+        case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
+      }
+
+      val result: ApiResult[(Int, TxnTransitMetadata)] = coordinatorEpochAndMetadata.right.flatMap {
+        existingEpochAndMetadata =>
+          val coordinatorEpoch = existingEpochAndMetadata.coordinatorEpoch
+          val txnMetadata = existingEpochAndMetadata.transactionMetadata
+
+          txnMetadata.inLock {
+            prepareInitProduceIdTransit(transactionalId, transactionTimeoutMs, coordinatorEpoch, txnMetadata)
+          }
+      }
+
+      result match {
+        case Left(error) =>
+          responseCallback(initTransactionError(error))
+
+        case Right((coordinatorEpoch, newMetadata)) =>
+          if (newMetadata.txnState == PrepareEpochFence) {
+            // abort the ongoing transaction and then return CONCURRENT_TRANSACTIONS to let client wait and retry
+            def sendRetriableErrorCallback(error: Errors): Unit = {
+              if (error != Errors.NONE) {
+                responseCallback(initTransactionError(error))
+              } else {
+                responseCallback(initTransactionError(Errors.CONCURRENT_TRANSACTIONS))
+              }
+            }
+
+            handleEndTransaction(transactionalId,
+              newMetadata.producerId,
+              newMetadata.producerEpoch,
+              TransactionResult.ABORT,
+              sendRetriableErrorCallback)
+          } else {
+            def sendPidResponseCallback(error: Errors): Unit = {
+              if (error == Errors.NONE) {
+                info(s"Initialized transactionalId $transactionalId with producerId ${newMetadata.producerId} and producer " +
+                  s"epoch ${newMetadata.producerEpoch} on partition " +
+                  s"${Topic.TRANSACTION_STATE_TOPIC_NAME}-${txnManager.partitionFor(transactionalId)}")
+                responseCallback(initTransactionMetadata(newMetadata))
+              } else {
+                info(s"Returning $error error code to client for $transactionalId's InitProducerId request")
+                responseCallback(initTransactionError(error))
+              }
+            }
+
+            txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendPidResponseCallback)
+          }
+      }
+    }
+  }    
+
+```
+　　handleInitProducerId()中检查如果transactionalId为null,则在producerIdManager中获取一个递增的ProducerId,因为ProducerId是全局唯一的，但如果每次都和Zookeeper交互保证唯一性则效率比较低，因此Kafka解决的思路是每次获取一批id号用于分配，如果消耗光了再与Zookeeper交互重新获取一批。
+
+
 
 ## <a id="exceptionhandle">异常处理</a>
 
