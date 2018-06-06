@@ -7,7 +7,7 @@ title: Kafka事务消息过程分析(一)
 ## 内容 
 >Status: Draft
 
-　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。
+　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。这里计划从源码实现的角度跟踪分析，因为源码贴的太多，分大概三到四篇来说明。这里是第一篇：事务的初始化。
 
 ## <a id="baseApi">基本调用</a>
 　　从客户端角度而言，完整的事务使用一般有如下几个调用：
