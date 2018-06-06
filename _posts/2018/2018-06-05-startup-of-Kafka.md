@@ -7,10 +7,10 @@ title: Kafka事务消息过程分析
 ## 内容 
 >Status: Draft
 
-Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。
+　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。
 
-## 事务过程
-从客户端角度而言，完整的事务使用一般有如下几个调用：
+## <a id="baseApi">基本调用</a>
+　　从客户端角度而言，完整的事务使用一般有如下几个调用：
 ```java
 KafkaProducer.initTransactions() // 事务初始化
 KafkaProducer.beginTransaction() // 开始事务
@@ -19,11 +19,13 @@ KafkaProducer.sendOffsetsToTransaction() //发送offset到消费组协调者
 KafkaProducer.commitTransaction() // 提交事务
 KafkaProducer.abortTransaction() // 终止事务
 ```
-下面分别从客户端和服务端两个角度来看事务初始化过程。
+　　下面分别从客户端和服务端两个角度来看事务初始化过程。
 
-## KafkaProducer
+## <a id="producer">KafkaProducer</a>
 
-初始化事务时检查transactionManager，initTransactionsResult，如果initTransactionsResult为null(初始化过程中不为null)则修改状态并生成InitProducerIdRequest请求获取ProducerId和Epoch的值，用于事务交互过程中服务端进行事务处理。
+　　初始化事务时检查transactionManager，initTransactionsResult，如果initTransactionsResult为null(初始化过程中不为null)则修改状态并生成InitProducerIdRequest请求获取ProducerId和Epoch的值，用于事务交互过程中服务端进行事务处理。
+
+**KafkaProducer**
 ```java
     public void initTransactions() {
         //如果transactionManager为null则无法使用事务，抛出异常
@@ -45,9 +47,11 @@ KafkaProducer.abortTransaction() // 终止事务
         }
     }
 ```
-初始化过程中调用TransactionManager.initializeTransactions()方法用于从TransactionCoordinate中获得ProducerId,Epoch。为了提高运行的效率，Kafka的请求通过后台专门的线程发送，后面会有专门的主题讲解，这里只需要了解请求通过enqueueRequest压入请求队列即可。
+
+　　初始化过程中调用TransactionManager.initializeTransactions()方法用于从TransactionCoordinate中获得ProducerId,Epoch。为了提高运行的效率，Kafka的请求通过后台专门的线程发送，后面会有专门的主题讲解，这里只需要了解请求通过enqueueRequest压入请求队列即可。
+
 ```java
-public synchronized TransactionalRequestResult initializeTransactions() {
+    public synchronized TransactionalRequestResult initializeTransactions() {
         ensureTransactional(); //保证用户有设置transactionalId
         transitionTo(State.INITIALIZING); // -> INITIALIZING
         setProducerIdAndEpoch(ProducerIdAndEpoch.NONE); 
@@ -61,11 +65,13 @@ public synchronized TransactionalRequestResult initializeTransactions() {
     }
 ```
 
-Sender是KafkaProducer发送请求到与Kafka集群的后台线程，主要用于更新metadata和发送produce请求到合适的broker节点。run()方法循环调用run(long now)。
+**Sender**
+
+　　Sender是KafkaProducer发送请求到与Kafka集群的后台线程，主要用于更新metadata和发送produce请求到合适的broker节点。run()方法循环调用run(long now)。
 
 ```java
 //Sender.java
-void run(long now) {
+    void run(long now) {
         //other code...
 
         else if (transactionManager.hasInFlightTransactionalRequest() || maybeSendTransactionalRequest(now)) {
@@ -147,22 +153,24 @@ void run(long now) {
         return true;
     }    
 ```
-从源码上看出在maybeSendTransactionalRequest()方法中如果事务协调node为null或不是ready状态则在transactionManager.lookupCoordinator()中插入发送FindCoordinatorRequest请求，重入maybeSendTransactionalRequest方法后随便一个正常的node就可以进行查找事务协调节点。时限取出来的InitProducerIdRequest请求会重新放到发送队列中。再重入时会因为协调员存在而完成初始化ProducerId,Epoch的请求。
+　　从源码上看出在maybeSendTransactionalRequest()方法中如果事务协调node为null或不是ready状态则在transactionManager.lookupCoordinator()中插入发送FindCoordinatorRequest请求，重入maybeSendTransactionalRequest方法后随便一个正常的node就可以进行查找事务协调节点。时限取出来的InitProducerIdRequest请求会重新放到发送队列中。再重入时会因为协调员存在而完成初始化ProducerId,Epoch的请求。
 FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionCoordinator用于Producer的事务处理。InitProducerIdHandler回调主要是更新本地ProducerId，epoch，并且修改事务状态为Ready。通过ProducerId，epoch就可以进行跨session的事务控制。
 
-至此客户端部分事务初始化介绍完毕。
+　　至此客户端部分事务初始化介绍完毕。
 
-## KafkaApis
+## <a id="brokerapi">KafkaApis</a>
 
-事务初始化阶段Producer主要发送了FindCoordinatorRequest，InitProducerIdHandler来确定协调node和获取ProducerIdAndEpoch。
+　　事务初始化阶段Producer主要发送了FindCoordinatorRequest，InitProducerIdHandler来确定协调node和获取ProducerIdAndEpoch。
 
-### FindCoordinatorRequest处理
+**FindCoordinatorRequest处理**
 
-### InitProducerIdHandler处理
+**InitProducerIdHandler处理**
 
-## 总结
+## <a id="exceptionhandle">异常处理</a>
 
-## References
+## <a id="conclusion">总结</a>
+
+## <a id="references">References</a>
 
 >https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
 
