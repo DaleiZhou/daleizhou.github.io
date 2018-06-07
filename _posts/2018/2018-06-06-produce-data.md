@@ -11,7 +11,7 @@ title: Kafka事务消息过程分析(二)
 
 ## <a id="beginTransaction">beginTransaction()</a>
 
-　　在调用KafkaProducer.send()方法之前需要调用KafkaProducer.beginTransaction()方法，这个方法的实现很简单，只是检查一些参数和修改内存状态,不需要与集群交互。
+　　在调用KafkaProducer.send()方法之前需要调用KafkaProducer.beginTransaction()方法，这个方法的实现很简单，只是检查一些参数和修改内存状态,本地认为事务开启，不需要与集群交互。TransactionCoordinator在第一条消息发送后才认为事务开启。
 
 ```java
     public synchronized void beginTransaction() {
@@ -123,7 +123,7 @@ title: Kafka事务消息过程分析(二)
                     return appendResult;
                 }
 
-                //batches中tp对应的batch队列为空，则新生成一个batch并放在dp中
+                //尝试append不成功，则新生成一个batch并放在dp中
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
                 //调用producerBatch.tryAppend方法将消息放入队列中，
@@ -146,7 +146,7 @@ title: Kafka事务消息过程分析(二)
         }
     }
 
-    //检查dq是否为空队列，如果不为空取最后一个batch将消息append到上面，否则直接返回null
+    //try append, 如果对应的dq为空队列，或者是batch.tryAppend如果在batch上没有足够空间等情况下直接返回null，在append()方法中会多次尝试，如果都收到null则会创建一个新的batch
     private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers,
                                          Callback callback, Deque<ProducerBatch> deque) {
         ProducerBatch last = deque.peekLast();
@@ -158,6 +158,30 @@ title: Kafka事务消息过程分析(二)
                 return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false);
         }
         return null;
+    }
+```
+
+TODO
+
+```java
+    //ProducerBatch.java
+    public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
+        // 如果没有足够的空间则返回null,调用者最终会生成一个新的batch
+        if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
+            return null;
+        } else {
+            //this.recordsBuilder.append()进行append数据
+            Long checksum = this.recordsBuilder.append(timestamp, key, value, headers);
+            this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
+                    recordsBuilder.compressionType(), key, value, headers));
+            this.lastAppendTime = now;
+            FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount, timestamp, checksum, key == null ? -1 : key.length, value == null ? -1 : value.length);
+            // we have to keep every future returned to the users in case the batch needs to be
+            // split to several new batches and resent.
+            thunks.add(new Thunk(callback, future));
+            this.recordCount++;
+            return future;
+        }
     }
 ```
 
