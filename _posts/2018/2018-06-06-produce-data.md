@@ -60,7 +60,12 @@ title: Kafka事务消息过程分析(二)
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
-            //other code ...
+            //检查是否需要发送AddPartitionsToTxnRequest,
+            //如果第一次发送给该TopicPartition,则将topicpartition写入TransactionManage.newPartitionsInTransaction缓存中，后续会有线程在发送消息数据之前处理该请求
+            //producer给新的topicPartition发送数据时需要向Coordinator发送该请求
+            //Coordinator会写入logb并置状态为BEGIN等
+            if (transactionManager != null && transactionManager.isTransactional())
+                transactionManager.maybeAddPartitionToTransaction(tp);
 
             //压入请求数据到队列，等待异步发送
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
@@ -73,6 +78,28 @@ title: Kafka事务消息过程分析(二)
         }
 
         //other code ...
+    }
+```
+
+　　在发送消息数据之前，如果producer是第一次发送给topicpartition，则生成一个AddPartitionsToTxnRequest请求，将所有类似的topicpartition放在请求中请求Coordinator。Coordinator的具体处理细节后面会介绍，这里先看producer端处理。请求是放在一个优先队列中，ADD_PARTITIONS_OR_OFFSETS的优先级为2，排在FIND_COORDINATOR和INIT_PRODUCER_ID后面。Producer端收到返回后更新本地缓存信息。
+
+```java
+    //TransactionManager.java
+    //在上一篇介绍过的TransactionManager.nextRequestHandler()方法中处理AddPartitionsToTxnRequest发送请求
+    synchronized TxnRequestHandler nextRequestHandler(boolean hasIncompleteBatches) {
+        if (!newPartitionsInTransaction.isEmpty())
+            enqueueRequest(addPartitionsToTransactionHandler());
+
+        //other code ...
+    }
+
+    //处理过程是将pendingPartitionsInTransaction + newPartitionsInTransaction数据拼成一个请求，带上ProducerId, epoch值发送给broker
+    private synchronized TxnRequestHandler addPartitionsToTransactionHandler() {
+        pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
+        newPartitionsInTransaction.clear();
+        AddPartitionsToTxnRequest.Builder builder = new AddPartitionsToTxnRequest.Builder(transactionalId,
+                producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, new ArrayList<>(pendingPartitionsInTransaction));
+        return new AddPartitionsToTxnHandler(builder);
     }
 ```
 
