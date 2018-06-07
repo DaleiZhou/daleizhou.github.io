@@ -76,7 +76,7 @@ title: Kafka事务消息过程分析(二)
     }
 ```
 
-　　KafkaProducer.doSend()方法在最后通过RecordAccumulator.append将消息放入RecordAccumulator中。RecordAccumulator类中通过ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches属性存储TopicPartition对应的batchs。batch放在双端队列中，是由于发送线程是从队首取数据进行发送，如果中途遇到异常则重新把batch塞回到队首，是一种容错的设计。
+　　KafkaProducer.doSend()方法在最后通过RecordAccumulator.append将消息放入RecordAccumulator中。RecordAccumulator类中通过ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches属性存储TopicPartition对应的batches。batch放在双端队列中，是由于发送线程是从队首取数据进行发送，如果中途遇到异常则重新把batch塞回到队首，是一种容错的设计。
 
 ```java
     //RecordAccumulator.java
@@ -93,18 +93,20 @@ title: Kafka事务消息过程分析(二)
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
-            // check if we have an in-progress batch
-            Deque<ProducerBatch> dq = getOrCreateDeque(tp); //取或者创建
+            // 从本地内存中batches变量中获取topicpartition对应的batch队列，如果没有则创建一个空的放入batches中并返回
+            Deque<ProducerBatch> dq = getOrCreateDeque(tp);
             synchronized (dq) {
+                // close情况下抛异常
                 if (closed)
                     throw new IllegalStateException("Cannot send after the producer is closed.");
+
+                // 调用tryAppend方法试着append消息, 如果append成功则返回，如果tp对应的batch队列为空则继续往下执行
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
-                //如果dq为null，返回appendResult = null，
+                //如果dq为null，返回appendResult = null
                 if (appendResult != null)
-                    return appendResult;
+                    return appendResult;    
             }
 
-            // we don't have an in-progress record batch try to allocate a new batch
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
@@ -114,14 +116,17 @@ title: Kafka事务消息过程分析(二)
                 if (closed)
                     throw new IllegalStateException("Cannot send after the producer is closed.");
 
+                //对dq加锁之后再次尝试tryAppend,同样地如果为append成功则直接返回结果
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
                     return appendResult;
                 }
 
+                //batches中tp对应的batch队列为空，则新生成一个batch并放在dp中
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
+                //调用producerBatch.tryAppend方法将消息放入队列中，
                 FutureRecordMetadata future = Utils.notNull(batch.tryAppend(timestamp, key, value, headers, callback, time.milliseconds()));
 
                 dq.addLast(batch);
@@ -130,6 +135,8 @@ title: Kafka事务消息过程分析(二)
                 // Don't deallocate this buffer in the finally block as it's being used in the record batch
                 buffer = null;
 
+                //执行到这里说明是新生成一个batch，返回appendresult时设置newBatchCreated = true, batchIsFull = dp.size>1 or 新生成的batch写入的字节数大于写入上限
+                //KafkaProducer的doSend中会检查这两个参数，决定是否调用sender.weakup
                 return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true);
             }
         } finally {
@@ -137,6 +144,20 @@ title: Kafka事务消息过程分析(二)
                 free.deallocate(buffer);
             appendsInProgress.decrementAndGet();
         }
+    }
+
+    //检查dq是否为空队列，如果不为空取最后一个batch将消息append到上面，否则直接返回null
+    private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers,
+                                         Callback callback, Deque<ProducerBatch> deque) {
+        ProducerBatch last = deque.peekLast();
+        if (last != null) {
+            FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, time.milliseconds());
+            if (future == null)
+                last.closeForRecordAppends();
+            else
+                return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false);
+        }
+        return null;
     }
 ```
 
