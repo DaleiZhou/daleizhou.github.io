@@ -188,7 +188,7 @@ title: Kafka事务消息过程分析(二)
     }
 ```
 
-TODO
+　　RecordAccumulator.append()或者是RecordAccumulator.tryAppend()方法append消息数据都是通过batch.tryAppend()来实现的。在batch.tryAppend()中通过recordsBuilder.append()方法来append数据。
 
 ```java
     //ProducerBatch.java
@@ -201,15 +201,57 @@ TODO
             Long checksum = this.recordsBuilder.append(timestamp, key, value, headers);
             this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
                     recordsBuilder.compressionType(), key, value, headers));
-            this.lastAppendTime = now;
-            FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount, timestamp, checksum, key == null ? -1 : key.length, value == null ? -1 : value.length);
-            // we have to keep every future returned to the users in case the batch needs to be
-            // split to several new batches and resent.
-            thunks.add(new Thunk(callback, future));
-            this.recordCount++;
-            return future;
+            
+            //more code ...
         }
     }
 ```
+
+　　MemoryRecordsBuilder维护一个offset,这个offset会写入最终发送的消息中，
+
+//todo
+borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
+
+根据消息版本不同使用不同的使用不同的方式写消息数据。
+
+```java
+    //MemoryRecordsBuilder.java
+    public Long append(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+        //nextSequentialOffset()获取SequentialOffset(),用于表示这个消息的Seqid
+        return appendWithOffset(nextSequentialOffset(), timestamp, key, value, headers);
+    }
+
+    private Long appendWithOffset(long offset, boolean isControlRecord, long timestamp, ByteBuffer key,
+                                  ByteBuffer value, Header[] headers) {
+        try {
+            // more code ...
+
+            //根据消息版本设置的magic值决定如何append数据,消息格式不一样
+            //如果版本>=2则调用DefaultRecord进行写数据，否则使用LegacyRecord进行写数据
+            if (magic > RecordBatch.MAGIC_VALUE_V1) {
+                appendDefaultRecord(offset, timestamp, key, value, headers);
+                return null;
+            } else {
+                return appendLegacyRecord(offset, timestamp, key, value);
+            }
+        } catch (IOException e) {
+            throw new KafkaException("I/O exception when writing to the append stream, closing", e);
+        }
+    }
+
+    // 这里只贴appendDefaultRecord()
+    private void appendDefaultRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value,
+                                     Header[] headers) throws IOException {
+        ensureOpenForRecordAppend();
+        // 这里发送相对时间戳和offset的偏移量
+        int offsetDelta = (int) (offset - baseOffset);
+        long timestampDelta = timestamp - firstTimestamp;
+        //通过DefaultRecord.writeTo()方法将数据写进appendStream.
+        int sizeInBytes = DefaultRecord.writeTo(appendStream, offsetDelta, timestampDelta, key, value, headers);
+        recordWritten(offset, timestamp, sizeInBytes);
+    }
+```
+
+　　到这里消息数据应该已经append到batch里了，每个topicPartition对应一个batch队列。在后台线程Sender.run()的循环中，每次循环中都会调用Sender.sendProducerData()方法拼装ProduceRequest将消息发送到对应的broker上。
 
 ## TBD
