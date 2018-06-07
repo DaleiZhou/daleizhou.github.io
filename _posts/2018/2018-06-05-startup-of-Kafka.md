@@ -155,9 +155,11 @@ KafkaProducer.abortTransaction() // 终止事务
         return true;
     }    
 ```
-　　从源码上看出在maybeSendTransactionalRequest()方法中如果事务协调node为null或不是ready状态则在transactionManager.lookupCoordinator()中插入发送FindCoordinatorRequest请求，重入maybeSendTransactionalRequest方法后随便一个正常的node就可以进行查找事务协调节点。时限取出来的InitProducerIdRequest请求会重新放到发送队列中。再重入时会因为协调员存在而完成初始化ProducerId,Epoch的请求。
+　　从源码上看出在maybeSendTransactionalRequest()方法中如果事务协调node为null或不是ready状态则在transactionManager.lookupCoordinator()中插入发送FindCoordinatorRequest请求，重入maybeSendTransactionalRequest方法后随便一个正常的node就可以进行查找事务协调节点。事先取出来的InitProducerIdRequest请求会重新放到发送队列中。再重入时会因为协调员存在而完成初始化ProducerId,Epoch的请求。
 
 　　FindCoordinatorHandler的回调很简单，更新TransactionManager.transactionCoordinator缓存保存对应的node信息用于Producer的事务处理。InitProducerIdHandler回调主要是更新本地ProducerId，epoch，并且修改事务状态为Ready。通过ProducerId，epoch就可以进行跨session的事务控制。
+
+　　如果客户端事务的特性未被开启，InitPidRequest可以被发送至任何borker上，同样地可以获得ProducerAndEpoch,但是这时只能保证Session内的事务特性。
 
 　　至此客户端部分事务初始化介绍完毕。
 
