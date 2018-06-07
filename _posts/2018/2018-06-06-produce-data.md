@@ -254,4 +254,170 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 
 　　到这里消息数据应该已经append到batch里了，每个topicPartition对应一个batch队列。在后台线程Sender.run()的循环中，每次循环中都会调用Sender.sendProducerData()方法拼装ProduceRequest将消息发送到对应的broker上。
 
+```java
+    //Sender.java
+    private long sendProducerData(long now) {
+        Cluster cluster = metadata.fetch();
+
+        // 获取数据已经可以发送的partitions列表
+        // accumulator.ready()方法中遍历batches,对于每个tp对应的batch队列：
+        // 如果leader为null，但队列不为空则将topic加入unknownLeaderTopics中
+        // tp不在muted队列中而且队列中，而且满足如如下任一条件都会将对应的node认为是ready的
+        // 1. 第一个batch为full 2. record等待时间至少lingerMs毫秒 3. accumulator被关闭
+        // 4. flushesInProgress数目大于0， 5. 等待分配内存的线程数目大于0
+        RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
+
+        // 因为topic过期或者某个topic处于选举过程中，使得unknownLeaderTopics不为空，即有的tp对应的leader无法获取，则强制更新metadata
+        if (!result.unknownLeaderTopics.isEmpty()) {
+            for (String topic : result.unknownLeaderTopics)
+                this.metadata.add(topic);
+            this.metadata.requestUpdate();
+        }
+
+        // 从网络连接角度删除没有ready的node
+        Iterator<Node> iter = result.readyNodes.iterator();
+        long notReadyTimeout = Long.MAX_VALUE;
+        while (iter.hasNext()) {
+            Node node = iter.next();
+            if (!this.client.ready(node, now)) {
+                iter.remove();
+                notReadyTimeout = Math.min(notReadyTimeout, this.client.connectionDelay(node, now));
+            }
+        }
+
+        // create produce requests
+        Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes,
+                this.maxRequestSize, now);
+        if (guaranteeMessageOrder) {
+            // Mute all the partitions drained
+            for (List<ProducerBatch> batchList : batches.values()) {
+                for (ProducerBatch batch : batchList)
+                    this.accumulator.mutePartition(batch.topicPartition);
+            }
+        }
+
+        List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(this.requestTimeout, now);
+        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
+        // for expired batches. see the documentation of @TransactionState.resetProducerId to understand why
+        // we need to reset the producer id here.
+        if (!expiredBatches.isEmpty())
+            log.trace("Expired {} batches in accumulator", expiredBatches.size());
+        for (ProducerBatch expiredBatch : expiredBatches) {
+            failBatch(expiredBatch, -1, NO_TIMESTAMP, expiredBatch.timeoutException(), false);
+            if (transactionManager != null && expiredBatch.inRetry()) {
+                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
+                transactionManager.markSequenceUnresolved(expiredBatch.topicPartition);
+            }
+        }
+
+        sensors.updateProduceRequestMetrics(batches);
+
+        // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
+        // loop and try sending more data. Otherwise, the timeout is determined by nodes that have partitions with data
+        // that isn't yet sendable (e.g. lingering, backing off). Note that this specifically does not include nodes
+        // with sendable data that aren't ready to send since they would cause busy looping.
+        long pollTimeout = Math.min(result.nextReadyCheckDelayMs, notReadyTimeout);
+        if (!result.readyNodes.isEmpty()) {
+            log.trace("Nodes with data ready to send: {}", result.readyNodes);
+            // if some partitions are already ready to be sent, the select time would be 0;
+            // otherwise if some partition already has some data accumulated but not ready yet,
+            // the select time will be the time difference between now and its linger expiry time;
+            // otherwise the select time will be the time difference between now and the metadata expiry time;
+            pollTimeout = 0;
+        }
+        sendProduceRequests(batches, now);
+
+        return pollTimeout;
+    }
+
+    private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
+        for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
+            sendProduceRequest(now, entry.getKey(), acks, requestTimeout, entry.getValue());
+    }
+
+    private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
+        if (batches.isEmpty())
+            return;
+
+        Map<TopicPartition, MemoryRecords> produceRecordsByPartition = new HashMap<>(batches.size());
+        final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
+
+        // find the minimum magic version used when creating the record sets
+        byte minUsedMagic = apiVersions.maxUsableProduceMagic();
+        for (ProducerBatch batch : batches) {
+            if (batch.magic() < minUsedMagic)
+                minUsedMagic = batch.magic();
+        }
+
+        for (ProducerBatch batch : batches) {
+            TopicPartition tp = batch.topicPartition;
+            MemoryRecords records = batch.records();
+
+            // down convert if necessary to the minimum magic used. In general, there can be a delay between the time
+            // that the producer starts building the batch and the time that we send the request, and we may have
+            // chosen the message format based on out-dated metadata. In the worst case, we optimistically chose to use
+            // the new message format, but found that the broker didn't support it, so we need to down-convert on the
+            // client before sending. This is intended to handle edge cases around cluster upgrades where brokers may
+            // not all support the same message format version. For example, if a partition migrates from a broker
+            // which is supporting the new magic version to one which doesn't, then we will need to convert.
+            if (!records.hasMatchingMagic(minUsedMagic))
+                records = batch.records().downConvert(minUsedMagic, 0, time).records();
+            produceRecordsByPartition.put(tp, records);
+            recordsByPartition.put(tp, batch);
+        }
+
+        String transactionalId = null;
+        if (transactionManager != null && transactionManager.isTransactional()) {
+            transactionalId = transactionManager.transactionalId();
+        }
+        ProduceRequest.Builder requestBuilder = ProduceRequest.Builder.forMagic(minUsedMagic, acks, timeout,
+                produceRecordsByPartition, transactionalId);
+        RequestCompletionHandler callback = new RequestCompletionHandler() {
+            public void onComplete(ClientResponse response) {
+                handleProduceResponse(response, recordsByPartition, time.milliseconds());
+            }
+        };
+
+        String nodeId = Integer.toString(destination);
+        ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0, callback);
+        client.send(clientRequest, now);
+        log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
+    }
+
+    private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
+        RequestHeader requestHeader = response.requestHeader();
+        int correlationId = requestHeader.correlationId();
+        if (response.wasDisconnected()) {
+            log.trace("Cancelled request with header {} due to node {} being disconnected",
+                    requestHeader, response.destination());
+            for (ProducerBatch batch : batches.values())
+                completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NETWORK_EXCEPTION), correlationId, now);
+        } else if (response.versionMismatch() != null) {
+            log.warn("Cancelled request {} due to a version mismatch with node {}",
+                    response, response.destination(), response.versionMismatch());
+            for (ProducerBatch batch : batches.values())
+                completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.UNSUPPORTED_VERSION), correlationId, now);
+        } else {
+            log.trace("Received produce response from node {} with correlation id {}", response.destination(), correlationId);
+            // if we have a response, parse it
+            if (response.hasResponse()) {
+                ProduceResponse produceResponse = (ProduceResponse) response.responseBody();
+                for (Map.Entry<TopicPartition, ProduceResponse.PartitionResponse> entry : produceResponse.responses().entrySet()) {
+                    TopicPartition tp = entry.getKey();
+                    ProduceResponse.PartitionResponse partResp = entry.getValue();
+                    ProducerBatch batch = batches.get(tp);
+                    completeBatch(batch, partResp, correlationId, now);
+                }
+                this.sensors.recordLatency(response.destination(), response.requestLatencyMs());
+            } else {
+                // this is the acks = 0 case, just complete all requests
+                for (ProducerBatch batch : batches.values()) {
+                    completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NONE), correlationId, now);
+                }
+            }
+        }
+    }
+
+```
+
 ## TBD
