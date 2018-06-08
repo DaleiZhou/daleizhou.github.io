@@ -606,6 +606,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 ## <a id="conclusion">总结</a>
 
 　　本篇介绍了一下Producer发送消息过程。Kafka在运行效率和一致性方面加入了一些设计，例如消息Accumulator，delayedProduce等，客户端只与leader交互，对每个客户端流量控制等，来提高Kafka集群整体运行效率。
+
 　　至此本篇的内容介绍完毕，下一篇会介绍发送完消息后commit/abort事务。
 
 ## <a id="references">References</a>
