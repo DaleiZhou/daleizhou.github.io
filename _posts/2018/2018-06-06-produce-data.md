@@ -9,7 +9,9 @@ title: Kafka事务消息过程分析(二)
 
 　　事务初始化完毕之后，KafkaProducer就可以向集群发送具体的消息数据。本篇从KafkaProducer.send()为切入点，介绍发送事务消息客户端和服务端的具体实现。
 
-## <a id="beginTransaction">beginTransaction()</a>
+## <a id="KafkaProducer">KafkaProducer</a>
+
+**beginTransaction**
 
 　　在调用KafkaProducer.send()方法之前需要调用KafkaProducer.beginTransaction()方法，这个方法的实现很简单，只是检查一些参数和修改内存状态,本地认为事务开启，不需要与集群交互。TransactionCoordinator在第一条消息发送后才认为事务开启。
 
@@ -21,7 +23,7 @@ title: Kafka事务消息过程分析(二)
     }
 ```
 
-## <a id="send">send()</a>
+**send**
 
 　　KafkaProducer.send()方法实现生产消息的发送，发送的record不仅可以指定topic,还可以指定partition，即指定消息发到指定分区中。如果用户不提供则使用系统默认的根据一些参数通过简单取模的方式得到分区，这种取模的方式可以做到消息基本上均匀分布在各个分区上。
 
@@ -232,12 +234,7 @@ title: Kafka事务消息过程分析(二)
     }
 ```
 
-　　MemoryRecordsBuilder维护一个offset,这个offset会写入最终发送的消息中，
-
-//todo
-borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
-
-根据消息版本不同使用不同的使用不同的方式写消息数据。
+　　MemoryRecordsBuilder维护一个offset,这个offset会写入最终发送的消息中。在MemoryRecordsBuilder中根据magic值不同使用不同的使用不同的方式写消息数据。
 
 ```java
     //MemoryRecordsBuilder.java
@@ -370,7 +367,11 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     }
 ```
 
-## <a id="handleAddPartitionToTxnRequest">handleAddPartitionToTxnRequest</a>
+## <a id="KafkaApis">KafkaApis</a>
+
+　　下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。
+
+**handleAddPartitionToTxnRequest**
 
 　　下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。AddPartitionToTxnRequest的请求处理过程比较简单，handleAddPartitionToTxnRequest()方法中处理。如果有身份验证失败或者不能识别的topicpartition则直接返回给客户端错误。
 
@@ -464,7 +465,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
   }
 ```
 
-## <a id="handleProduceRequest">handleProduceRequest</a>
+**handleProduceRequest**
 
 　　客户端发送的ProducerRequest同样也在KafkaApis中处理。为了提高整体运行效率，kafka在0.9版本引入了配额（quotas）控制的概念。每个client的数据交互速率通过多个小窗口抽样得到，broker会对每个ClientId有一定的阈值，延迟返结果给交互太快的客户端。这种限速对客户端是透明的，而不是broker直接告诉客户端需要降速，因此客户端不需要考虑特别多的复杂情况。限于篇幅和主题的原因，这个部分后面有机会详细展开，这里只需要认为返回给客户端结果，不影响理解。
 
@@ -612,15 +613,4 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 ## <a id="references">References</a>
 
 * http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
-
-
-
-
-
-
-
-
-
-
-
 
