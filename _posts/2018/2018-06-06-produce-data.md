@@ -370,7 +370,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     }
 ```
 
-下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。AddPartitionToTxnRequest的请求处理过程比较简单，handleAddPartitionToTxnRequest()方法中处理。如果有身份验证失败或者不能识别的topicpartition则直接返回给客户端错误。
+　　下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。AddPartitionToTxnRequest的请求处理过程比较简单，handleAddPartitionToTxnRequest()方法中处理。如果有身份验证失败或者不能识别的topicpartition则直接返回给客户端错误。
 
 ```scala
     //KafkaApis.scala
@@ -408,7 +408,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 
 ```
 
-handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
+　　handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
 
 ```scala
    //TransactionCoordinator.scala
@@ -430,7 +430,7 @@ handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handle
           val coordinatorEpoch = epochAndMetadata.coordinatorEpoch
           val txnMetadata = epochAndMetadata.transactionMetadata
 
-          // generate the new transaction metadata with added partitions
+          // 异常处理 or 生成metadata
           txnMetadata.inLock {
             if (txnMetadata.producerId != producerId) {
               Left(Errors.INVALID_PRODUCER_ID_MAPPING)
