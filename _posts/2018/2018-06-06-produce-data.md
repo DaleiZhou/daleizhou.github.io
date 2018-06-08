@@ -370,6 +370,8 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     }
 ```
 
+## <a id="handleAddPartitionToTxnRequest">handleAddPartitionToTxnRequest</a>
+
 　　下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。AddPartitionToTxnRequest的请求处理过程比较简单，handleAddPartitionToTxnRequest()方法中处理。如果有身份验证失败或者不能识别的topicpartition则直接返回给客户端错误。
 
 ```scala
@@ -405,7 +407,6 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
       }
     }
   }
-
 ```
 
 　　handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
@@ -461,8 +462,100 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
       }
     }
   }
-
 ```
 
+## <a id="handleProduceRequest">handleProduceRequest</a>
+
+```scala
+   def handle(request: RequestChannel.Request) {
+        case ApiKeys.PRODUCE => handleProduceRequest(request)
+    }
+
+   // producer request 处理过程
+   def handleProduceRequest(request: RequestChannel.Request) {
+    val produceRequest = request.body[ProduceRequest]
+    val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
+
+    // 身份验证，未知tp处理 more code ...
+
+    // produce结果回调
+    def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]) {
+
+      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses
+      var errorInResponse = false
+
+      mergedResponseStatus.foreach { case (topicPartition, status) =>
+        if (status.error != Errors.NONE) {
+          errorInResponse = true
+          debug("Produce request with correlation id %d from client %s on partition %s failed due to %s".format(
+            request.header.correlationId,
+            request.header.clientId,
+            topicPartition,
+            status.error.exceptionName))
+        }
+      }
+
+      def produceResponseCallback(bandwidthThrottleTimeMs: Int) {
+        if (produceRequest.acks == 0) {
+          // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
+          // the request, since no response is expected by the producer, the server will close socket server so that
+          // the producer client will know that some error has happened and will refresh its metadata
+          if (errorInResponse) {
+            val exceptionsSummary = mergedResponseStatus.map { case (topicPartition, status) =>
+              topicPartition -> status.error.exceptionName
+            }.mkString(", ")
+            info(
+              s"Closing connection due to error during produce request with correlation id ${request.header.correlationId} " +
+                s"from client id ${request.header.clientId} with ack=0\n" +
+                s"Topic and partition to exceptions: $exceptionsSummary"
+            )
+            closeConnection(request, new ProduceResponse(mergedResponseStatus.asJava).errorCounts)
+          } else {
+            sendNoOpResponseExemptThrottle(request)
+          }
+        } else {
+          sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new ProduceResponse(mergedResponseStatus.asJava, bandwidthThrottleTimeMs + requestThrottleMs))
+        }
+      }
+
+      // When this callback is triggered, the remote API call has completed
+      request.apiRemoteCompleteTimeNanos = time.nanoseconds
+
+      quotas.produce.maybeRecordAndThrottle(
+        request.session,
+        request.header.clientId,
+        numBytesAppended,
+        produceResponseCallback)
+    }
+
+    def processingStatsCallback(processingStats: Map[TopicPartition, RecordsProcessingStats]): Unit = {
+      processingStats.foreach { case (tp, info) =>
+        updateRecordsProcessingStats(request, tp, info)
+      }
+    }
+
+    if (authorizedRequestInfo.isEmpty)
+      sendResponseCallback(Map.empty)
+    else {
+      val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
+
+      // call the replica manager to append messages to the replicas
+      replicaManager.appendRecords(
+        timeout = produceRequest.timeout.toLong,
+        requiredAcks = produceRequest.acks,
+        internalTopicsAllowed = internalTopicsAllowed,
+        isFromClient = true,
+        entriesPerPartition = authorizedRequestInfo,
+        responseCallback = sendResponseCallback,
+        processingStatsCallback = processingStatsCallback)
+
+      // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
+      // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      produceRequest.clearPartitionRecords()
+    }
+  }
+
+```
 
 ## TBD
