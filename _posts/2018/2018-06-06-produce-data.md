@@ -83,6 +83,8 @@ title: Kafka事务消息过程分析(二)
 
 　　在发送消息数据之前，如果producer是第一次发送给topicpartition，则生成一个AddPartitionsToTxnRequest请求，将所有类似的topicpartition放在请求中请求Coordinator。Coordinator的具体处理细节后面会介绍，这里先看producer端处理。请求是放在一个优先队列中，ADD_PARTITIONS_OR_OFFSETS的优先级为2，排在FIND_COORDINATOR和INIT_PRODUCER_ID后面。Producer端收到返回后更新本地缓存信息。
 
+　　AddPartitionsToTxnRequest中带有本Producer中transactionalId, producerId, epoch等信息，Coordinattor在接收到请求之后有异常处理，例如epoch过期，producerId和transactionId不合预期等情况进行错误返回，Producer在AddPartitionsToTxnHandler回调方法中对这些错误情况进行处理，使得跨Session的事务控制的部分异常情况在AddPartition阶段就开始避免。
+
 ```java
     //TransactionManager.java
     //在上一篇介绍过的TransactionManager.nextRequestHandler()方法中处理AddPartitionsToTxnRequest发送请求
@@ -93,7 +95,7 @@ title: Kafka事务消息过程分析(二)
         //other code ...
     }
 
-    //处理过程是将pendingPartitionsInTransaction + newPartitionsInTransaction数据拼成一个请求，带上ProducerId, epoch值发送给broker
+    //处理过程是将pendingPartitionsInTransaction + newPartitionsInTransaction数据拼成一个请求，带上ProducerId, epoch值发送给broker，用于broker端对这些值进行检查并且错误处理
     private synchronized TxnRequestHandler addPartitionsToTransactionHandler() {
         pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
         newPartitionsInTransaction.clear();
@@ -101,6 +103,29 @@ title: Kafka事务消息过程分析(二)
                 producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, new ArrayList<>(pendingPartitionsInTransaction));
         return new AddPartitionsToTxnHandler(builder);
     }
+
+    private class AddPartitionsToTxnHandler extends TxnRequestHandler {
+        
+        @Override
+        public void handleResponse(AbstractResponse response) {
+                //more code ...
+
+                else if (error == Errors.INVALID_PRODUCER_EPOCH) {
+                    fatalError(error.exception());
+                    return;
+                } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) {
+                    fatalError(error.exception());
+                    return;
+                } else if (error == Errors.INVALID_PRODUCER_ID_MAPPING
+                        || error == Errors.INVALID_TXN_STATE) {
+                    fatalError(new KafkaException(error.exception()));
+                    return;
+                }
+            }
+    }
+
+
+
 ```
 
 　　KafkaProducer.doSend()方法在最后通过RecordAccumulator.append将消息放入RecordAccumulator中。RecordAccumulator类中通过ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches属性存储TopicPartition对应的batches。batch放在双端队列中，是由于发送线程是从队首取数据进行发送，如果中途遇到异常则重新把batch塞回到队首，是一种容错的设计。
@@ -274,7 +299,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
             this.metadata.requestUpdate();
         }
 
-        // 从网络连接角度删除没有ready的node
+        // 从网络连接角度处理没有ready的node
         Iterator<Node> iter = result.readyNodes.iterator();
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
@@ -285,81 +310,38 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
             }
         }
 
-        // create produce requests
+        // 创建produce请求数据准备，在accumulator.drain方法中通过一个drainIndex%size避免每次循环都从0开始，均衡所有请求。
+        //对于那些不在in-flight队列中的batches且不在重试等待期内,对size, sequence, producerIdAndEpoch等进行检查，最终返回一个每个node对应的ready队列用于发送给服务器
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes,
                 this.maxRequestSize, now);
         if (guaranteeMessageOrder) {
-            // Mute all the partitions drained
+            // 如果是消息保序的，则将drain得到的batches对应的tp放入mute队列中
             for (List<ProducerBatch> batchList : batches.values()) {
                 for (ProducerBatch batch : batchList)
                     this.accumulator.mutePartition(batch.topicPartition);
             }
         }
 
-        List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(this.requestTimeout, now);
-        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
-        // for expired batches. see the documentation of @TransactionState.resetProducerId to understand why
-        // we need to reset the producer id here.
-        if (!expiredBatches.isEmpty())
-            log.trace("Expired {} batches in accumulator", expiredBatches.size());
-        for (ProducerBatch expiredBatch : expiredBatches) {
-            failBatch(expiredBatch, -1, NO_TIMESTAMP, expiredBatch.timeoutException(), false);
-            if (transactionManager != null && expiredBatch.inRetry()) {
-                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
-                transactionManager.markSequenceUnresolved(expiredBatch.topicPartition);
-            }
-        }
+        // more code ...
 
-        sensors.updateProduceRequestMetrics(batches);
-
-        // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
-        // loop and try sending more data. Otherwise, the timeout is determined by nodes that have partitions with data
-        // that isn't yet sendable (e.g. lingering, backing off). Note that this specifically does not include nodes
-        // with sendable data that aren't ready to send since they would cause busy looping.
-        long pollTimeout = Math.min(result.nextReadyCheckDelayMs, notReadyTimeout);
-        if (!result.readyNodes.isEmpty()) {
-            log.trace("Nodes with data ready to send: {}", result.readyNodes);
-            // if some partitions are already ready to be sent, the select time would be 0;
-            // otherwise if some partition already has some data accumulated but not ready yet,
-            // the select time will be the time difference between now and its linger expiry time;
-            // otherwise the select time will be the time difference between now and the metadata expiry time;
-            pollTimeout = 0;
-        }
         sendProduceRequests(batches, now);
-
         return pollTimeout;
     }
 
+    //内部方法，分别发送每个node对应的batches
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
         for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
             sendProduceRequest(now, entry.getKey(), acks, requestTimeout, entry.getValue());
     }
 
     private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
-        if (batches.isEmpty())
-            return;
-
-        Map<TopicPartition, MemoryRecords> produceRecordsByPartition = new HashMap<>(batches.size());
-        final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
-
-        // find the minimum magic version used when creating the record sets
-        byte minUsedMagic = apiVersions.maxUsableProduceMagic();
-        for (ProducerBatch batch : batches) {
-            if (batch.magic() < minUsedMagic)
-                minUsedMagic = batch.magic();
-        }
+        // more code ...
 
         for (ProducerBatch batch : batches) {
             TopicPartition tp = batch.topicPartition;
             MemoryRecords records = batch.records();
 
-            // down convert if necessary to the minimum magic used. In general, there can be a delay between the time
-            // that the producer starts building the batch and the time that we send the request, and we may have
-            // chosen the message format based on out-dated metadata. In the worst case, we optimistically chose to use
-            // the new message format, but found that the broker didn't support it, so we need to down-convert on the
-            // client before sending. This is intended to handle edge cases around cluster upgrades where brokers may
-            // not all support the same message format version. For example, if a partition migrates from a broker
-            // which is supporting the new magic version to one which doesn't, then we will need to convert.
+            // down convert if necessary 
             if (!records.hasMatchingMagic(minUsedMagic))
                 records = batch.records().downConvert(minUsedMagic, 0, time).records();
             produceRecordsByPartition.put(tp, records);
@@ -370,54 +352,117 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
         if (transactionManager != null && transactionManager.isTransactional()) {
             transactionalId = transactionManager.transactionalId();
         }
+
+        //构造produce请求，设置回调handler
         ProduceRequest.Builder requestBuilder = ProduceRequest.Builder.forMagic(minUsedMagic, acks, timeout,
                 produceRecordsByPartition, transactionalId);
         RequestCompletionHandler callback = new RequestCompletionHandler() {
             public void onComplete(ClientResponse response) {
+                //设置结果回调方法，在handleProduceResponse对服务端返回结果进行处理，包括成功情况下删除，失败情况下重新放入队列，序列号重复情况下处理等。
                 handleProduceResponse(response, recordsByPartition, time.milliseconds());
             }
         };
 
         String nodeId = Integer.toString(destination);
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0, callback);
+        // 放入in-fight队列中，会有后台线程从infight队列中取数据发送给brokers
         client.send(clientRequest, now);
-        log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
+    }
+```
+
+下面我们看服务器部分如何处理AddPartitionToTxnRequest和ProduceRequest。AddPartitionToTxnRequest的请求处理过程比较简单，handleAddPartitionToTxnRequest()方法中处理。如果有身份验证失败或者不能识别的topicpartition则直接返回给客户端错误。
+
+```scala
+    //KafkaApis.scala
+   def handle(request: RequestChannel.Request) {
+        case ApiKeys.ADD_PARTITIONS_TO_TXN => handleAddPartitionToTxnRequest(request)
     }
 
-    private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
-        RequestHeader requestHeader = response.requestHeader();
-        int correlationId = requestHeader.correlationId();
-        if (response.wasDisconnected()) {
-            log.trace("Cancelled request with header {} due to node {} being disconnected",
-                    requestHeader, response.destination());
-            for (ProducerBatch batch : batches.values())
-                completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NETWORK_EXCEPTION), correlationId, now);
-        } else if (response.versionMismatch() != null) {
-            log.warn("Cancelled request {} due to a version mismatch with node {}",
-                    response, response.destination(), response.versionMismatch());
-            for (ProducerBatch batch : batches.values())
-                completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.UNSUPPORTED_VERSION), correlationId, now);
-        } else {
-            log.trace("Received produce response from node {} with correlation id {}", response.destination(), correlationId);
-            // if we have a response, parse it
-            if (response.hasResponse()) {
-                ProduceResponse produceResponse = (ProduceResponse) response.responseBody();
-                for (Map.Entry<TopicPartition, ProduceResponse.PartitionResponse> entry : produceResponse.responses().entrySet()) {
-                    TopicPartition tp = entry.getKey();
-                    ProduceResponse.PartitionResponse partResp = entry.getValue();
-                    ProducerBatch batch = batches.get(tp);
-                    completeBatch(batch, partResp, correlationId, now);
-                }
-                this.sensors.recordLatency(response.destination(), response.requestLatencyMs());
-            } else {
-                // this is the acks = 0 case, just complete all requests
-                for (ProducerBatch batch : batches.values()) {
-                    completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NONE), correlationId, now);
-                }
-            }
+   def handleAddPartitionToTxnRequest(request: RequestChannel.Request): Unit = {
+      //处理身份验证和无法识别的topic-partition
+
+      //mote code ...
+
+      if (unauthorizedTopicErrors.nonEmpty || nonExistingTopicErrors.nonEmpty) {
+        //如果存在身份验证失败或无法识别的tp，直接返回给客户端错误交由客户端处理
+      } else {
+        def sendResponseCallback(error: Errors): Unit = {
+          def createResponse(requestThrottleMs: Int): AbstractResponse = {
+            val responseBody: AddPartitionsToTxnResponse = new AddPartitionsToTxnResponse(requestThrottleMs,
+              partitionsToAdd.map{tp => (tp, error)}.toMap.asJava)
+            trace(s"Completed $transactionalId's AddPartitionsToTxnRequest with partitions $partitionsToAdd: errors: $error from client ${request.header.clientId}")
+            responseBody
+          }
+
+          sendResponseMaybeThrottle(request, createResponse)
         }
+
+        txnCoordinator.handleAddPartitionsToTransaction(transactionalId,
+          addPartitionsToTxnRequest.producerId,
+          addPartitionsToTxnRequest.producerEpoch,
+          authorizedPartitions,
+          sendResponseCallback)
+      }
     }
+  }
 
 ```
+
+handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
+
+```scala
+   //TransactionCoordinator.scala
+   def handleAddPartitionsToTransaction(transactionalId: String,
+                                       producerId: Long,
+                                       producerEpoch: Short,
+                                       partitions: collection.Set[TopicPartition],
+                                       responseCallback: AddPartitionsCallback): Unit = {
+    if (transactionalId == null || transactionalId.isEmpty) {
+      debug(s"Returning ${Errors.INVALID_REQUEST} error code to client for $transactionalId's AddPartitions request")
+      responseCallback(Errors.INVALID_REQUEST)
+    } else {
+      // try to update the transaction metadata and append the updated metadata to txn log;
+      // if there is no such metadata treat it as invalid producerId mapping error.
+      val result: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+        case None => Left(Errors.INVALID_PRODUCER_ID_MAPPING)
+
+        case Some(epochAndMetadata) =>
+          val coordinatorEpoch = epochAndMetadata.coordinatorEpoch
+          val txnMetadata = epochAndMetadata.transactionMetadata
+
+          // generate the new transaction metadata with added partitions
+          txnMetadata.inLock {
+            if (txnMetadata.producerId != producerId) {
+              Left(Errors.INVALID_PRODUCER_ID_MAPPING)
+            } else if (txnMetadata.producerEpoch != producerEpoch) {
+              Left(Errors.INVALID_PRODUCER_EPOCH)
+            } else if (txnMetadata.pendingTransitionInProgress) {
+              // return a retriable exception to let the client backoff and retry
+              Left(Errors.CONCURRENT_TRANSACTIONS)
+            } else if (txnMetadata.state == PrepareCommit || txnMetadata.state == PrepareAbort) {
+              Left(Errors.CONCURRENT_TRANSACTIONS)
+            } else if (txnMetadata.state == Ongoing && partitions.subsetOf(txnMetadata.topicPartitions)) {
+              // this is an optimization: if the partitions are already in the metadata reply OK immediately
+              Left(Errors.NONE)
+            } else {
+              Right(coordinatorEpoch, txnMetadata.prepareAddPartitions(partitions.toSet, time.milliseconds()))
+            }
+          }
+      }
+
+      result match {
+        case Left(err) =>
+          debug(s"Returning $err error code to client for $transactionalId's AddPartitions request")
+          responseCallback(err)
+
+        case Right((coordinatorEpoch, newMetadata)) =>
+          //正常情况处理，将metadata写入事务日志中，appendTransactionToLog()中将消息写入事务日志，并等待足够数量的ack，如果成功则更新缓存信息并调用responseCallback()返回结果给客户端
+          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, responseCallback)
+      }
+    }
+  }
+
+```
+
 
 ## TBD
