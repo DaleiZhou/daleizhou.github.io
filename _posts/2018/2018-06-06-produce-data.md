@@ -531,6 +531,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
+      // 内部topic只允许AdmintUtil调用
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // 通过replicaManage进行append消息到副本leader中，并且等待其他副本复制完毕，callback方法会在超时或者ack数目得到满足时被调用
