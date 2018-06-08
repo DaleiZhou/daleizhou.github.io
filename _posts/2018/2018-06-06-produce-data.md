@@ -469,6 +469,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 　　客户端发送的ProducerRequest同样也在KafkaApis中处理。为了提高整体运行效率，kafka在0.9版本引入了配额（quotas）控制的概念。每个client的数据交互速率通过多个小窗口抽样得到，broker会对每个ClientId有一定的阈值，延迟返结果给交互太快的客户端。这种限速对客户端是透明的，而不是broker直接告诉客户端需要降速，因此客户端不需要考虑特别多的复杂情况。限于篇幅和主题的原因，这个部分后面有机会详细展开，这里只需要认为返回给客户端结果，不影响理解。
 
 ```scala
+   // KafkaApis.scala
    def handle(request: RequestChannel.Request) {
         case ApiKeys.PRODUCE => handleProduceRequest(request)
     }
@@ -504,7 +505,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
             sendNoOpResponseExemptThrottle(request)
           }
         } else {
-          //限速发送回结果
+          //最终会调用这个方法进行限速发送回结果
           sendResponseMaybeThrottle(request, requestThrottleMs =>
             new ProduceResponse(mergedResponseStatus.asJava, bandwidthThrottleTimeMs + requestThrottleMs))
         }
@@ -513,6 +514,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
       // When this callback is triggered, the remote API call has completed
       request.apiRemoteCompleteTimeNanos = time.nanoseconds
 
+      //流量控制发送会结果
       quotas.produce.maybeRecordAndThrottle(
         request.session,
         request.header.clientId,
@@ -531,7 +533,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     else {
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
-      // 通过replicaManage进行append请求的消息
+      // 通过replicaManage进行append消息到副本leader中，并且等待其他副本复制完毕，callback方法会在超时或者ack数目得到满足时被调用
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
@@ -547,6 +549,8 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
   }
 ```
 
+　　Kafka的消息的发布与消费都是客户端从metadata中获取topicpartition的leader并与之交互，因此ReplicaManager.appendRecords()方法需要将消息写入本地副本中，并且等待其他副本对这条消息的复制，等待ack是否满足一定条件或超时就调用callback方法返回处理结果。下面看具体的代码分析:
+
 ```scala
   //ReplicaManager.scala
   def appendRecords(timeout: Long,
@@ -559,10 +563,14 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
                     processingStatsCallback: Map[TopicPartition, RecordsProcessingStats] => Unit = _ => ()) {
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
+
+      //作为leader写入本地消息日志中，首选杜绝写入内部topic,
+      //此时已经不是leader，则抛异常
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         isFromClient = isFromClient, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
 
+      //生成produceStatus用于DelayedProduce的检查，包含offset等信息用于检查副本对leader的追赶程度
       val produceStatus = localProduceResults.map { case (topicPartition, result) =>
         topicPartition ->
                 ProducePartitionStatus(
@@ -573,26 +581,16 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
       processingStatsCallback(localProduceResults.mapValues(_.info.recordsProcessingStats))
 
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
-        // create delayed produce operation
-        val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
-        val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
-
-        // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
-        val producerRequestKeys = entriesPerPartition.keys.map(new TopicPartitionOperationKey(_)).toSeq
-
-        // try to complete the request immediately, otherwise put it into the purgatory
-        // this is because while the delayed produce operation is being created, new
-        // requests may arrive and hence make this operation completable.
-        delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
-
+        // DelayedProduce延迟等待主从同步结果
+        
+        // more code ...
       } else {
-        // we can respond immediately
+        // delayedProduceRequestRequired为false情况下立即返回
         val produceResponseStatus = produceStatus.mapValues(status => status.responseStatus)
         responseCallback(produceResponseStatus)
       }
     } else {
-      // If required.acks is outside accepted range, something is wrong with the client
-      // Just return an error and don't handle the request at all
+      //ack不在可接受范围之内，直接不处理请求，直接返回错误给客户端
       val responseStatus = entriesPerPartition.map { case (topicPartition, _) =>
         topicPartition -> new PartitionResponse(Errors.INVALID_REQUIRED_ACKS,
           LogAppendInfo.UnknownLogAppendInfo.firstOffset.getOrElse(-1), RecordBatch.NO_TIMESTAMP, LogAppendInfo.UnknownLogAppendInfo.logStartOffset)
@@ -602,4 +600,25 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
   }
 ```
 
-## TBD
+　　消息写入分区leader的本地日志后，需要等待其它副本对他的复制，满足一定的ack条件时才认为消息提交完成，返回结果给客户端。主从同步是followers发送fetchrequest同副本leader进行同步，来追赶leader。消息写入leader的日志后，使用DelayedProduce来检查副本对leader追赶程度，这里不详细介绍。
+
+## <a id="conclusion">总结</a>
+
+　　本篇介绍了一下Producer发送消息过程。Kafka在运行效率和一致性方面加入了一些设计，例如消息Accumulator，delayedProduce等，客户端只与leader交互，对每个客户端流量控制等，来提高Kafka集群整体运行效率。
+　　至此本篇的内容介绍完毕，下一篇会介绍发送完消息后commit/abort事务。
+
+## <a id="references">References</a>
+
+* http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
+
+
+
+
+
+
+
+
+
+
+
+
