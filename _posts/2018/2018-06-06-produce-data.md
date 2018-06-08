@@ -466,6 +466,8 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
 
 ## <a id="handleProduceRequest">handleProduceRequest</a>
 
+　　客户端发送的ProducerRequest同样也在KafkaApis中处理。为了提高整体运行效率，kafka在0.9版本引入了配额（quotas）控制的概念。每个client的数据交互速率通过多个小窗口抽样得到，broker会对每个ClientId有一定的阈值，延迟返结果给交互太快的客户端。这种限速对客户端是透明的，而不是broker直接告诉客户端需要降速，因此客户端不需要考虑特别多的复杂情况。限于篇幅和主题的原因，这个部分后面有机会详细展开，这里只需要认为返回给客户端结果，不影响理解。
+
 ```scala
    def handle(request: RequestChannel.Request) {
         case ApiKeys.PRODUCE => handleProduceRequest(request)
@@ -484,36 +486,25 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses
       var errorInResponse = false
 
-      mergedResponseStatus.foreach { case (topicPartition, status) =>
-        if (status.error != Errors.NONE) {
-          errorInResponse = true
-          debug("Produce request with correlation id %d from client %s on partition %s failed due to %s".format(
-            request.header.correlationId,
-            request.header.clientId,
-            topicPartition,
-            status.error.exceptionName))
-        }
-      }
+      // more code ...
 
       def produceResponseCallback(bandwidthThrottleTimeMs: Int) {
         if (produceRequest.acks == 0) {
-          // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
-          // the request, since no response is expected by the producer, the server will close socket server so that
-          // the producer client will know that some error has happened and will refresh its metadata
+          // ack == 0又无错误时不需要做操作返回给客户端，
+          // 而如果如果errorInResponse != null
+          // 则关闭连接，客户端感知到连接关闭会刷新metadata
           if (errorInResponse) {
             val exceptionsSummary = mergedResponseStatus.map { case (topicPartition, status) =>
               topicPartition -> status.error.exceptionName
             }.mkString(", ")
-            info(
-              s"Closing connection due to error during produce request with correlation id ${request.header.correlationId} " +
-                s"from client id ${request.header.clientId} with ack=0\n" +
-                s"Topic and partition to exceptions: $exceptionsSummary"
-            )
+            //log code ...
+
             closeConnection(request, new ProduceResponse(mergedResponseStatus.asJava).errorCounts)
           } else {
             sendNoOpResponseExemptThrottle(request)
           }
         } else {
+          //限速发送回结果
           sendResponseMaybeThrottle(request, requestThrottleMs =>
             new ProduceResponse(mergedResponseStatus.asJava, bandwidthThrottleTimeMs + requestThrottleMs))
         }
@@ -540,7 +531,7 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
     else {
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
-      // call the replica manager to append messages to the replicas
+      // 通过replicaManage进行append请求的消息
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
@@ -550,12 +541,65 @@ borker端根据这个seqid和ProducerIdAndEpoch进行事务控制。
         responseCallback = sendResponseCallback,
         processingStatsCallback = processingStatsCallback)
 
-      // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
-      // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      //正常append结束后清空requestrecords,否则如果请求被放入purgatory中，因为一直持引用，导致gc无法回收
       produceRequest.clearPartitionRecords()
     }
   }
+```
 
+```scala
+  //ReplicaManager.scala
+  def appendRecords(timeout: Long,
+                    requiredAcks: Short,
+                    internalTopicsAllowed: Boolean,
+                    isFromClient: Boolean,
+                    entriesPerPartition: Map[TopicPartition, MemoryRecords],
+                    responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
+                    delayedProduceLock: Option[Lock] = None,
+                    processingStatsCallback: Map[TopicPartition, RecordsProcessingStats] => Unit = _ => ()) {
+    if (isValidRequiredAcks(requiredAcks)) {
+      val sTime = time.milliseconds
+      val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
+        isFromClient = isFromClient, entriesPerPartition, requiredAcks)
+      debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
+
+      val produceStatus = localProduceResults.map { case (topicPartition, result) =>
+        topicPartition ->
+                ProducePartitionStatus(
+                  result.info.lastOffset + 1, // required offset
+                  new PartitionResponse(result.error, result.info.firstOffset.getOrElse(-1), result.info.logAppendTime, result.info.logStartOffset)) // response status
+      }
+
+      processingStatsCallback(localProduceResults.mapValues(_.info.recordsProcessingStats))
+
+      if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
+        // create delayed produce operation
+        val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
+        val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
+
+        // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
+        val producerRequestKeys = entriesPerPartition.keys.map(new TopicPartitionOperationKey(_)).toSeq
+
+        // try to complete the request immediately, otherwise put it into the purgatory
+        // this is because while the delayed produce operation is being created, new
+        // requests may arrive and hence make this operation completable.
+        delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
+
+      } else {
+        // we can respond immediately
+        val produceResponseStatus = produceStatus.mapValues(status => status.responseStatus)
+        responseCallback(produceResponseStatus)
+      }
+    } else {
+      // If required.acks is outside accepted range, something is wrong with the client
+      // Just return an error and don't handle the request at all
+      val responseStatus = entriesPerPartition.map { case (topicPartition, _) =>
+        topicPartition -> new PartitionResponse(Errors.INVALID_REQUIRED_ACKS,
+          LogAppendInfo.UnknownLogAppendInfo.firstOffset.getOrElse(-1), RecordBatch.NO_TIMESTAMP, LogAppendInfo.UnknownLogAppendInfo.logStartOffset)
+      }
+      responseCallback(responseStatus)
+    }
+  }
 ```
 
 ## TBD
