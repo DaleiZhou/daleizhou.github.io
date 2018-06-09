@@ -5,7 +5,9 @@ title: Kafka事务消息过程分析(三)
 ---
 
 ## 内容 
->Status: Draft
+
+>代码版本: 2.0.0-SNAPSHOT
+>Blog tatus: Draft
 
 　　上篇介绍完KafkaProducer发送事务消息，但是这些消息对于Consumer是不可见的。只有事务提交完才是可见的。本篇介绍消息事务的commit/abort。
 
@@ -186,7 +188,7 @@ title: Kafka事务消息过程分析(三)
         case Right((coordinatorEpoch, newMetadata)) =>
 
           // 定义事务成功写入日志后的回调的方法
-          // 该回调方法用于发送事务Marker，在发送前需要做各种异常检查用于故障处理
+          // 该回调方法用于发送事务Marker，在发送marker请求前，需要做各种异常检查用于故障处理
           def sendTxnMarkersCallback(error: Errors): Unit = {
             if (error == Errors.NONE) {
               val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
@@ -223,7 +225,7 @@ title: Kafka事务消息过程分析(三)
                   //执行到这个部分，是因为因为metarecord写入log成功后回调了sendTxnMarkersCallback()方法，因此这里立即返回结果给客户端，如果txnmarker请求成功前该broker挂掉，新的coordinator会有异常处理流程
                   responseCallback(Errors.NONE)
 
-                  //开始事务maker流程
+                  //开始发送send marker流程
                   txnMarkerChannelManager.addTxnMarkersToSend(transactionalId, coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
               }
             } else {
@@ -237,3 +239,12 @@ title: Kafka事务消息过程分析(三)
     }
   }
 ```
+
+
+　　txnManager.appendTransactionToLog()这个方法之前篇幅中已经见过，所做的处理大致总结为根据输入参数生成record,写入分区log中，更新本地缓存状态，返回正常/异常结果等。这里不做更详细的阐述，我们只需要知道handleEndTransaction()中生成的newMetadata被写入分区log中，并完成主从同步后调用sendTxnMarkersCallback()返回结果给客户端及开启发送TxnMarkers流程。
+
+
+
+
+
+

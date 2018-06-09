@@ -5,7 +5,9 @@ title: Kafka事务消息过程分析(二)
 ---
 
 ## 内容 
->Status: Draft
+
+>代码版本: 2.0.0-SNAPSHOT
+>Blog tatus: Draft
 
 　　事务初始化完毕之后，KafkaProducer就可以向集群发送具体的消息数据。本篇从KafkaProducer.send()为切入点，介绍发送事务消息客户端和服务端的具体实现。
 
