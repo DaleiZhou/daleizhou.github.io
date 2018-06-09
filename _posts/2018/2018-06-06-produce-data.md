@@ -410,7 +410,7 @@ title: Kafka事务消息过程分析(二)
   }
 ```
 
-　　handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
+　　handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入日志中及等待足够数量的followers返回。
 
 　　特别地在调用txnManager.appendTransactionToLog()方法前，会调用txnMetadata.prepareAddPartitions()方法将txnMetadata状态置为Ongoing，用于后面的事务的提交。事务状态从Empty变为Ongoing状态情况总共有两种，一种是AddPartitionsToTxnRequest请求处理，另一种是后面会介绍的AddOffsetsToTxnRequest处理。
 
@@ -461,7 +461,7 @@ title: Kafka事务消息过程分析(二)
           responseCallback(err)
 
         case Right((coordinatorEpoch, newMetadata)) =>
-          //正常情况处理，将metadata写入事务日志中，appendTransactionToLog()中将消息写入事务日志，并等待足够数量的ack，如果成功则更新缓存信息并调用responseCallback()返回结果给客户端
+          //正常情况处理，将metadata写入日志中，appendTransactionToLog()中将消息写入日志，并等待足够数量的ack，如果成功则更新缓存信息并调用responseCallback()返回结果给客户端
           txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, responseCallback)
       }
     }

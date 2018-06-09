@@ -390,7 +390,7 @@ KafkaProducer.abortTransaction() // 终止事务
 
 　　handleInitProducerId()中检查如果transactionalId为null,则在producerIdManager中获取一个递增的ProducerId,因为ProducerId是全局唯一的，但如果每次都和Zookeeper交互保证唯一性则效率比较低，因此Kafka解决的思路是每次获取一批id号用于分配，如果消耗光了再与Zookeeper交互重新获取一批。
 
-　　在handleInitProducerId()的最后，如果是正常情况下会调用txnManager.appendTransactionToLog()中将结果接入事务日志中。
+　　在handleInitProducerId()的最后，如果是正常情况下会调用txnManager.appendTransactionToLog()中将结果接入日志中。
 
 ```scala
   def appendTransactionToLog(transactionalId: String,
@@ -446,9 +446,9 @@ KafkaProducer.abortTransaction() // 终止事务
     }
 
     inReadLock(stateLock) {
-      // 直到写本地事务日志结束才放锁,这是为了避免在check操作完成之后，
+      // 直到写本地日志结束才放锁,这是为了避免在check操作完成之后，
       // appendRecords()操作完成之前发生了一个迁出迁入的完整过程使得更高的epoch写入到log中，就会导致appendRecords写入一个旧的epoch值，
-      // followes上的副本还可以复制，让事务日志处于一个不正常的状态
+      // followes上的副本还可以复制，让日志处于一个不正常的状态
  
       getTransactionState(transactionalId) match {
         case Left(err) =>
@@ -467,7 +467,7 @@ KafkaProducer.abortTransaction() // 终止事务
               responseCallback(Errors.NOT_COORDINATOR)
               false
             } else {
-              // 加锁之后不会更新metadata,因此如果epoch值是预期的，则append到事务日志中
+              // 加锁之后不会更新metadata,因此如果epoch值是预期的，则append到日志中
               true
             }
           }
@@ -490,7 +490,7 @@ KafkaProducer.abortTransaction() // 终止事务
 
 ```
 
-　　在Replicamanager中appendRecords操作将MemoryRecords写入partition对应的leader中，并且等待其它副本的同步，当且ack数量满足条件或者超时立即调用callback，主从同步部分会有一个专门的章节介绍，这里先理解Kafka保证写入了leader和follow的事务日志中。
+　　在Replicamanager中appendRecords操作将MemoryRecords写入partition对应的leader中，并且等待其它副本的同步，当且ack数量满足条件或者超时立即调用callback，主从同步部分会有一个专门的章节介绍，这里先理解Kafka保证写入了leader和follow的日志中。
 
 　　至此，事务初始化服务器端部分介绍完毕。
 

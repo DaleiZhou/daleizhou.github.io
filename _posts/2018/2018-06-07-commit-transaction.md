@@ -95,10 +95,10 @@ title: Kafka事务消息过程分析(三)
 
 ## <a id="KafkaApis">KafkaApis</a>
 
-　　事务的提交客户端部分处理比较简单，主要来看服务端的处理。
+　　事务的提交客户端部分处理比较简单，主要来看服务端的处理。KafkaApis里接收到END_TXN请求后调用handleEndTxnRequest()方法处理，而handleEndTxnRequest()方法中验证身份通过之后将请求中的数据取出来，交给TransactionCoordinator去处理。
 
 ```scala
-  //KafkaApis.scaladef 
+  //KafkaApis.scala 
   def handle(request: RequestChannel.Request) {
         case ApiKeys.END_TXN => handleEndTxnRequest(request)
   }
@@ -115,6 +115,7 @@ title: Kafka事务消息过程分析(三)
           trace(s"Completed ${endTxnRequest.transactionalId}'s EndTxnRequest with command: ${endTxnRequest.command}, errors: $error from client ${request.header.clientId}.")
           responseBody
         }
+        //限流发送回结果
         sendResponseMaybeThrottle(request, createResponse)
       }
 
@@ -130,9 +131,11 @@ title: Kafka事务消息过程分析(三)
   }
 ```
 
+　　TransactionCoordinator中首先进行一系列的异常情况处理，如果有异常，如producerid,epoch不符合预期值，则生成错误返回给客户端让客户端自行进行异常处理。正常情况下handleEndTransaction()预期的txnMetadata的状态为Ongoing，
+
 ```scala
-  //TransactionCoordinator.scaladef 
-  handleEndTransaction(transactionalId: String,
+  //TransactionCoordinator.scala
+  def handleEndTransaction(transactionalId: String,
                            producerId: Long,
                            producerEpoch: Short,
                            txnMarkerResult: TransactionResult,
@@ -149,14 +152,11 @@ title: Kafka事务消息过程分析(三)
           val coordinatorEpoch = epochAndTxnMetadata.coordinatorEpoch
 
           txnMetadata.inLock {
-            if (txnMetadata.producerId != producerId)
-              Left(Errors.INVALID_PRODUCER_ID_MAPPING)
-            else if (producerEpoch < txnMetadata.producerEpoch)
-              Left(Errors.INVALID_PRODUCER_EPOCH)
-            else if (txnMetadata.pendingTransitionInProgress && txnMetadata.pendingState.get != PrepareEpochFence)
-              Left(Errors.CONCURRENT_TRANSACTIONS)
+            // exception handle code ...
+
             else txnMetadata.state match {
               case Ongoing =>
+                //根据传入的TransactionResult决定下一个状态为Prepare or abort
                 val nextState = if (txnMarkerResult == TransactionResult.COMMIT)
                   PrepareCommit
                 else
@@ -169,35 +169,9 @@ title: Kafka事务消息过程分析(三)
                   txnMetadata.producerEpoch = producerEpoch
                 }
 
+                //调用prepareAbortOrCommit()设置TransactionMeta的状态为PrepareCommit/PrepareAbort和更新一些缓存信息
                 Right(coordinatorEpoch, txnMetadata.prepareAbortOrCommit(nextState, time.milliseconds()))
-              case CompleteCommit =>
-                if (txnMarkerResult == TransactionResult.COMMIT)
-                  Left(Errors.NONE)
-                else
-                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-              case CompleteAbort =>
-                if (txnMarkerResult == TransactionResult.ABORT)
-                  Left(Errors.NONE)
-                else
-                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-              case PrepareCommit =>
-                if (txnMarkerResult == TransactionResult.COMMIT)
-                  Left(Errors.CONCURRENT_TRANSACTIONS)
-                else
-                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-              case PrepareAbort =>
-                if (txnMarkerResult == TransactionResult.ABORT)
-                  Left(Errors.CONCURRENT_TRANSACTIONS)
-                else
-                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-              case Empty =>
-                logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-              case Dead | PrepareEpochFence =>
-                val errorMsg = s"Found transactionalId $transactionalId with state ${txnMetadata.state}. " +
-                  s"This is illegal as we should never have transitioned to this state."
-                fatal(errorMsg)
-                throw new IllegalStateException(errorMsg)
-
+              // more code ...
             }
           }
       }
@@ -208,6 +182,9 @@ title: Kafka事务消息过程分析(三)
           responseCallback(err)
 
         case Right((coordinatorEpoch, newMetadata)) =>
+
+          // 定义事务成功写入日志后的回调方法
+          // 该回调方法  
           def sendTxnMarkersCallback(error: Errors): Unit = {
             if (error == Errors.NONE) {
               val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
@@ -234,6 +211,7 @@ title: Kafka事务消息过程分析(三)
                           if (txnMarkerResult != TransactionResult.COMMIT)
                             logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
                           else
+                            //prepareComplete值状态为PrepareCommit
                             Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
                         case PrepareAbort =>
                           if (txnMarkerResult != TransactionResult.ABORT)
