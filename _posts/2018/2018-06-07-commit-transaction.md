@@ -20,18 +20,20 @@ title: Kafka事务消息过程分析(三)
         //通过transactionManager提交事务
         TransactionalRequestResult result = transactionManager.beginCommit();
         sender.wakeup();
+        //等待结果返回或超时
         result.await();
     }
 ```
 
 　　TransactionManager.beginCompletingTransaction()方法根据传入的TransactionResult构造EndTxnRequest。EndTxnRequest中会传入transactionalId, producerId, epoch, transactionResult等信息用于提交到服务端用于事务的提交。EndTxnHandler用于接收到服务端返回的成功结果后的处理。在EndTxnHandler.handleResponse()中，如果没有任何错误则设置本地状态及清空相关的缓存队列用于下一次事务提交准备，如果有错误则根据不同的错误类型有不同的处理方法。对于Coordinator不可用重新将请求放入队列稍后待条件满足时重新提交。对于一些其它的情况，如epoch过期，txn状态异常等情况设置状态为错误或直接抛出异常。
+　　特别地，在TransactionManager.beginCommit()方法中将本地状态置为COMMITTING_TRANSACTION，Sender线程maybeSendTransactionalRequest()方法中会检查这个状态，使得accumulator中的数据立即都置为ready状态，立即全部发送出去。
 
 ```java
     //TransactionManager.java
     public synchronized TransactionalRequestResult beginCommit() {
         ensureTransactional();
         maybeFailWithError();
-        //修改本地状态，变为COMMITTING_TRANSACTION
+        //修改本地状态，变为COMMITTING_TRANSACTION，accumulator会进行flush发送完所有数据
         transitionTo(State.COMMITTING_TRANSACTION);
         //传入TransactionResult.COMMIT，构造EndTxnRequest提交事务
         return beginCompletingTransaction(TransactionResult.COMMIT);
@@ -183,76 +185,53 @@ title: Kafka事务消息过程分析(三)
 
         case Right((coordinatorEpoch, newMetadata)) =>
 
-          // 定义事务成功写入日志后的回调方法
-          // 该回调方法  
+          // 定义事务成功写入日志后的回调的方法
+          // 该回调方法用于发送事务Marker，在发送前需要做各种异常检查用于故障处理
           def sendTxnMarkersCallback(error: Errors): Unit = {
             if (error == Errors.NONE) {
               val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
                 case None =>
-                  val errorMsg = s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
-                    s"no metadata in the cache; this is not expected"
-                  fatal(errorMsg)
-                  throw new IllegalStateException(errorMsg)
+                  // more code ...
 
                 case Some(epochAndMetadata) =>
                   if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
                     val txnMetadata = epochAndMetadata.transactionMetadata
                     txnMetadata.inLock {
-                      if (txnMetadata.producerId != producerId)
-                        Left(Errors.INVALID_PRODUCER_ID_MAPPING)
-                      else if (txnMetadata.producerEpoch != producerEpoch)
-                        Left(Errors.INVALID_PRODUCER_EPOCH)
-                      else if (txnMetadata.pendingTransitionInProgress)
-                        Left(Errors.CONCURRENT_TRANSACTIONS)
+                      // error handle code ... 
+
                       else txnMetadata.state match {
-                        case Empty| Ongoing | CompleteCommit | CompleteAbort =>
-                          logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
+                        // error handle code ... 
+
                         case PrepareCommit =>
                           if (txnMarkerResult != TransactionResult.COMMIT)
                             logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
                           else
-                            //prepareComplete值状态为PrepareCommit
+                            //根据txnMetadata生成 newPreSendMetadata，prepareComplete置状态为PrepareCommit
                             Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
-                        case PrepareAbort =>
-                          if (txnMarkerResult != TransactionResult.ABORT)
-                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)
-                          else
-                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
-                        case Dead | PrepareEpochFence =>
-                          val errorMsg = s"Found transactionalId $transactionalId with state ${txnMetadata.state}. " +
-                            s"This is illegal as we should never have transitioned to this state."
-                          fatal(errorMsg)
-                          throw new IllegalStateException(errorMsg)
-
+                        //more code ...
                       }
                     }
                   } else {
-                    debug(s"The transaction coordinator epoch has changed to ${epochAndMetadata.coordinatorEpoch} after $txnMarkerResult was " +
-                      s"successfully appended to the log for $transactionalId with old epoch $coordinatorEpoch")
-                    Left(Errors.NOT_COORDINATOR)
+                    //more code ...
                   }
               }
 
               preSendResult match {
-                case Left(err) =>
-                  info(s"Aborting sending of transaction markers after appended $txnMarkerResult to transaction log and returning $err error to client for $transactionalId's EndTransaction request")
-                  responseCallback(err)
+                //more code ...
 
                 case Right((txnMetadata, newPreSendMetadata)) =>
-                  // we can respond to the client immediately and continue to write the txn markers if
-                  // the log append was successful
+                  //执行到这个部分，是因为因为metarecord写入log成功后回调了sendTxnMarkersCallback()方法，因此这里立即返回结果给客户端，如果txnmarker请求成功前该broker挂掉，新的coordinator会有异常处理流程
                   responseCallback(Errors.NONE)
 
+                  //开始事务maker流程
                   txnMarkerChannelManager.addTxnMarkersToSend(transactionalId, coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
               }
             } else {
-              info(s"Aborting sending of transaction markers and returning $error error to client for $transactionalId's EndTransaction request of $txnMarkerResult, " +
-                s"since appending $newMetadata to transaction log with coordinator epoch $coordinatorEpoch failed")
-
-              responseCallback(error)
+              //more code ...
             }
           }
 
+          //写入事务到log中
           txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendTxnMarkersCallback)
       }
     }
