@@ -412,6 +412,8 @@ title: Kafka事务消息过程分析(二)
 
 　　handleAddPartitionToTxnRequest()在正常情况下会调用txnCoordinator.handleAddPartitionsToTransaction()方法。handleAddPartitionsToTransaction()方法中首先对各种不正常情况进行处理，如没有正常的transactionalId，producerEpoch过期，producerId不合预期等情况下会返回错误给客户端。如果没有错误则调用txnManager.appendTransactionToLog()方法写入事务日志中及等待足够数量的followers返回。
 
+　　特别地在调用txnManager.appendTransactionToLog()方法前，会调用txnMetadata.prepareAddPartitions()方法将txnMetadata状态置为Ongoing，用于后面的事务的提交。事务状态从Empty变为Ongoing状态情况总共有两种，一种是AddPartitionsToTxnRequest请求处理，另一种是后面会介绍的AddOffsetsToTxnRequest处理。
+
 ```scala
    //TransactionCoordinator.scala
    def handleAddPartitionsToTransaction(transactionalId: String,
@@ -432,7 +434,7 @@ title: Kafka事务消息过程分析(二)
           val coordinatorEpoch = epochAndMetadata.coordinatorEpoch
           val txnMetadata = epochAndMetadata.transactionMetadata
 
-          // 异常处理 or 生成metadata
+          // 异常处情况及正常情况处理
           txnMetadata.inLock {
             if (txnMetadata.producerId != producerId) {
               Left(Errors.INVALID_PRODUCER_ID_MAPPING)
@@ -447,6 +449,7 @@ title: Kafka事务消息过程分析(二)
               // this is an optimization: if the partitions are already in the metadata reply OK immediately
               Left(Errors.NONE)
             } else {
+              //在正常情况下会调用prepareAddPartitions()方法将TransactionMetadata状态置为Ongoing
               Right(coordinatorEpoch, txnMetadata.prepareAddPartitions(partitions.toSet, time.milliseconds()))
             }
           }
