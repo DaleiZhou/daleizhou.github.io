@@ -243,7 +243,7 @@ title: Kafka事务消息过程分析(三)
 
 　　txnManager.appendTransactionToLog()这个方法之前篇幅中已经见过，所做的处理大致总结为根据输入参数生成record,写入分区log中，更新本地缓存状态，返回正常/异常结果等。这里不做更详细的阐述，我们只需要知道handleEndTransaction()中生成的newMetadata被写入分区log中，并完成主从同步后调用sendTxnMarkersCallback()返回结果给客户端及开启发送TxnMarkers流程。
 
-　　TransactionMarkerChannelManager.addTxnMarkersToSend()中开启发送TxnMarkers流程，该方法主要作用为构建一个DelayedTxnMarker，用于延迟检查是否
+　　TransactionMarkerChannelManager.addTxnMarkersToSend()中开启发送TxnMarkers流程，该方法主要作用为构建一个DelayedTxnMarker，用于延迟检查是否marker请求成功发送并正常返回。如果正常则调用appendToLogCallback()将TxnLogAppend写入日志，完成整个事务提交的最后一步骤。
 
 ```scala
 // TransactionMarkerChannelManager.scala
@@ -292,49 +292,21 @@ title: Kafka事务消息过程分析(三)
     for ((broker: Option[Node], topicPartitions: immutable.Set[TopicPartition]) <- partitionsByDestination) {
       broker match {
         case Some(brokerNode) =>
+          // 构造Txn marker信息
           val marker = new TxnMarkerEntry(producerId, producerEpoch, coordinatorEpoch, result, topicPartitions.toList.asJava)
           val txnIdAndMarker = TxnIdAndMarkerEntry(transactionalId, marker)
 
           if (brokerNode == Node.noNode) {
-            // if the leader of the partition is known but node not available, put it into an unknown broker queue
-            // and let the sender thread to look for its broker and migrate them later
+            // 收集broker未知的topicpartition的marker,sender线程会进入查找对应的broker
             markersQueueForUnknownBroker.addMarkers(txnTopicPartition, txnIdAndMarker)
           } else {
+            //broker已知，写入markersQueuePerBroker队列中
+            //markersQueuePerBroker队列为每个broker对应一个队列，类似于客户端到服务端的网络请求合并处理
             addMarkersForBroker(brokerNode, txnTopicPartition, txnIdAndMarker)
           }
 
         case None =>
-          txnStateManager.getTransactionState(transactionalId) match {
-            case Left(error) =>
-              info(s"Encountered $error trying to fetch transaction metadata for $transactionalId with coordinator epoch $coordinatorEpoch; cancel sending markers to its partition leaders")
-              txnMarkerPurgatory.cancelForKey(transactionalId)
-
-            case Right(Some(epochAndMetadata)) =>
-              if (epochAndMetadata.coordinatorEpoch != coordinatorEpoch) {
-                info(s"The cached metadata has changed to $epochAndMetadata (old coordinator epoch is $coordinatorEpoch) since preparing to send markers; cancel sending markers to its partition leaders")
-                txnMarkerPurgatory.cancelForKey(transactionalId)
-              } else {
-                // if the leader of the partition is unknown, skip sending the txn marker since
-                // the partition is likely to be deleted already
-                info(s"Couldn't find leader endpoint for partitions $topicPartitions while trying to send transaction markers for " +
-                  s"$transactionalId, these partitions are likely deleted already and hence can be skipped")
-
-                val txnMetadata = epochAndMetadata.transactionMetadata
-
-                txnMetadata.inLock {
-                  topicPartitions.foreach(txnMetadata.removePartition)
-                }
-
-                txnMarkerPurgatory.checkAndComplete(transactionalId)
-              }
-
-            case Right(None) =>
-              val errorMsg = s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
-                s"no metadata in the cache; this is not expected"
-              fatal(errorMsg)
-              throw new IllegalStateException(errorMsg)
-
-          }
+          // 异常情况处理
       }
     }
 
