@@ -116,7 +116,6 @@ title: Kafka事务消息过程分析(三)
       def sendResponseCallback(error: Errors) {
         def createResponse(requestThrottleMs: Int): AbstractResponse = {
           val responseBody = new EndTxnResponse(requestThrottleMs, error)
-          trace(s"Completed ${endTxnRequest.transactionalId}'s EndTxnRequest with command: ${endTxnRequest.command}, errors: $error from client ${request.header.clientId}.")
           responseBody
         }
         //限流发送回结果
@@ -181,9 +180,7 @@ title: Kafka事务消息过程分析(三)
       }
 
       preAppendResult match {
-        case Left(err) =>
-          debug(s"Aborting append of $txnMarkerResult to transaction log with coordinator and returning $err error to client for $transactionalId's EndTransaction request")
-          responseCallback(err)
+        // other code ...
 
         case Right((coordinatorEpoch, newMetadata)) =>
 
@@ -324,56 +321,9 @@ title: Kafka事务消息过程分析(三)
     val requestHeader = response.requestHeader
     val correlationId = requestHeader.correlationId
     if (response.wasDisconnected) {
-      trace(s"Cancelled request with header $requestHeader due to node ${response.destination} being disconnected")
-
-      for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
-        val transactionalId = txnIdAndMarker.txnId
-        val txnMarker = txnIdAndMarker.txnMarkerEntry
-
-        txnStateManager.getTransactionState(transactionalId) match {
-
-          case Left(Errors.NOT_COORDINATOR) =>
-            info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
-
-            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-
-          case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
-            info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
-              s"cancel sending transaction markers $txnMarker to the brokers")
-
-            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-
-          case Left(unexpectedError) =>
-            throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
-
-          case Right(None) =>
-            throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
-              s"no metadata in the cache; this is not expected")
-
-          case Right(Some(epochAndMetadata)) =>
-            if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
-              // coordinator epoch has changed, just cancel it from the purgatory
-              info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
-                s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
-
-              txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-            } else {
-              // re-enqueue the markers with possibly new destination brokers
-              trace(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
-                s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
-
-              txnMarkerChannelManager.addTxnMarkersToBrokerQueue(transactionalId,
-                txnMarker.producerId,
-                txnMarker.producerEpoch,
-                txnMarker.transactionResult,
-                txnMarker.coordinatorEpoch,
-                txnMarker.partitions.asScala.toSet)
-            }
-        }
-      }
+      // destination不可达，异常处理，如果有必要重新将请求塞入请求队列
     } else {
-      debug(s"Received WriteTxnMarker response $response from node ${response.destination} with correlation id $correlationId")
-
+      
       val writeTxnMarkerResponse = response.responseBody.asInstanceOf[WriteTxnMarkersResponse]
 
       for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
@@ -381,27 +331,10 @@ title: Kafka事务消息过程分析(三)
         val txnMarker = txnIdAndMarker.txnMarkerEntry
         val errors = writeTxnMarkerResponse.errors(txnMarker.producerId)
 
-        if (errors == null)
-          throw new IllegalStateException(s"WriteTxnMarkerResponse does not contain expected error map for producer id ${txnMarker.producerId}")
+        //more code ...
 
         txnStateManager.getTransactionState(transactionalId) match {
-          case Left(Errors.NOT_COORDINATOR) =>
-            info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
-
-            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-
-          case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
-            info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
-              s"cancel sending transaction markers $txnMarker to the brokers")
-
-            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-
-          case Left(unexpectedError) =>
-            throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
-
-          case Right(None) =>
-            throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
-              s"no metadata in the cache; this is not expected")
+          // more code ...
 
           case Right(Some(epochAndMetadata)) =>
             val txnMetadata = epochAndMetadata.transactionMetadata
@@ -409,57 +342,17 @@ title: Kafka事务消息过程分析(三)
             var abortSending: Boolean = false
 
             if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
-              // coordinator epoch has changed, just cancel it from the purgatory
-              info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
-                s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
-
-              txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-              abortSending = true
+              // epoch 过期处理
             } else {
               txnMetadata.inLock {
                 for ((topicPartition, error) <- errors.asScala) {
                   error match {
                     case Errors.NONE =>
+                      // 没有错误则将topicpartiton从txnMetadata缓存中移除，如果txnMetadata全部移除，会使DelayedTxnMarker执行onComplete()方法，
+                      //即回调completionCallback()方法，将commit/abort结果返回给客户端
                       txnMetadata.removePartition(topicPartition)
 
-                    case Errors.CORRUPT_MESSAGE |
-                         Errors.MESSAGE_TOO_LARGE |
-                         Errors.RECORD_LIST_TOO_LARGE |
-                         Errors.INVALID_REQUIRED_ACKS => // these are all unexpected and fatal errors
-
-                      throw new IllegalStateException(s"Received fatal error ${error.exceptionName} while sending txn marker for $transactionalId")
-
-                    case Errors.UNKNOWN_TOPIC_OR_PARTITION |
-                         Errors.NOT_LEADER_FOR_PARTITION |
-                         Errors.NOT_ENOUGH_REPLICAS |
-                         Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND |
-                         Errors.REQUEST_TIMED_OUT => // these are retriable errors
-
-                      info(s"Sending $transactionalId's transaction marker for partition $topicPartition has failed with error ${error.exceptionName}, retrying " +
-                        s"with current coordinator epoch ${epochAndMetadata.coordinatorEpoch}")
-
-                      retryPartitions += topicPartition
-
-                    case Errors.INVALID_PRODUCER_EPOCH |
-                         Errors.TRANSACTION_COORDINATOR_FENCED => // producer or coordinator epoch has changed, this txn can now be ignored
-
-                      info(s"Sending $transactionalId's transaction marker for partition $topicPartition has permanently failed with error ${error.exceptionName} " +
-                        s"with the current coordinator epoch ${epochAndMetadata.coordinatorEpoch}; cancel sending any more transaction markers $txnMarker to the brokers")
-
-                      txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
-                      abortSending = true
-
-                    case Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT |
-                         Errors.UNSUPPORTED_VERSION =>
-                      // The producer would have failed to send data to the failed topic so we can safely remove the partition
-                      // from the set waiting for markers
-                      info(s"Sending $transactionalId's transaction marker from partition $topicPartition has failed with " +
-                        s" ${error.name}. This partition will be removed from the set of partitions" +
-                        s" waiting for completion")
-                      txnMetadata.removePartition(topicPartition)
-
-                    case other =>
-                      throw new IllegalStateException(s"Unexpected error ${other.exceptionName} while sending txn marker for $transactionalId")
+                    // other exception handle code ...
                   }
                 }
               }
@@ -467,10 +360,7 @@ title: Kafka事务消息过程分析(三)
 
             if (!abortSending) {
               if (retryPartitions.nonEmpty) {
-                debug(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
-                  s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
-
-                // re-enqueue with possible new leaders of the partitions
+                // 还能拯救一下，重新addTxnMarkersToBrokerQueue()
                 txnMarkerChannelManager.addTxnMarkersToBrokerQueue(
                   transactionalId,
                   txnMarker.producerId,
@@ -479,6 +369,7 @@ title: Kafka事务消息过程分析(三)
                   txnMarker.coordinatorEpoch,
                   retryPartitions.toSet)
               } else {
+                // 检查delay op是否可以结束，如果可以结束则从watch中将key移除
                 txnMarkerChannelManager.completeSendMarkersForTxnId(transactionalId)
               }
             }
@@ -488,8 +379,7 @@ title: Kafka事务消息过程分析(三)
   }
 ```
 
-
-　　接下来我们看收到WriteTxnMarkersRequest的broker是如何处理该请求的。
+　　接下来我们看收到WriteTxnMarkersRequest的broker是如何处理该请求的。接收到WriteTxnMarkersRequest的broker调用handleWriteTxnMarkersRequest处理，检查参数无误后将commit/abort的marker写入日志，主从同步后调用maybeSendResponseCallback()更新group coordinator中offset缓存，将提交的事务对group可见。
 
 ```scala
   def handle(request: RequestChannel.Request) {
@@ -508,24 +398,18 @@ title: Kafka事务消息过程分析(三)
 
     // 会被多次调用，通过numAppends进行计数，最后一次调用sendResponseExemptThrottle()将结果发送回请求方
     def maybeSendResponseCallback(producerId: Long, result: TransactionResult)(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
-      trace(s"End transaction marker append for producer id $producerId completed with status: $responseStatus")
-      val currentErrors = new ConcurrentHashMap[TopicPartition, Errors](responseStatus.mapValues(_.error).asJava)
-      updateErrors(producerId, currentErrors)
+
       val successfulOffsetsPartitions = responseStatus.filter { case (topicPartition, partitionResponse) =>
         topicPartition.topic == GROUP_METADATA_TOPIC_NAME && partitionResponse.error == Errors.NONE
       }.keys
 
       if (successfulOffsetsPartitions.nonEmpty) {
-        // as soon as the end transaction marker has been written for a transactional offset commit,
-        // call to the group coordinator to materialize the offsets into the cache
+        //事务的commit/abort的marker完全写入日志后,调用groupCoordinator.scheduleHandleTxnCompletion()将相关被隔离的事务对group可见
         try {
           groupCoordinator.scheduleHandleTxnCompletion(producerId, successfulOffsetsPartitions, result)
         } catch {
           case e: Exception =>
-            error(s"Received an exception while trying to update the offsets cache on transaction marker append", e)
-            val updatedErrors = new ConcurrentHashMap[TopicPartition, Errors]()
-            successfulOffsetsPartitions.foreach(updatedErrors.put(_, Errors.UNKNOWN_SERVER_ERROR))
-            updateErrors(producerId, updatedErrors)
+            // exception handle code ...
         }
       }
 
@@ -558,4 +442,12 @@ title: Kafka事务消息过程分析(三)
   }
 ```
 
-### TBD
+## <a id="conclusion">总结</a>
+
+　　本篇介绍了Producer对事务的commit/abort的具体执行过程。Kafka的事务的本质是对Offset进行标记相同的Transaction Marker来实现事务的读写操作，通过Marker是否写入实现对事物的隔离。KafkaProducer对事务的提交EndTxnHandler提交给对应的Coordinator，Coordinator将record写入log中并完成主从同步，接着会通过broker内部线程，主动产生一个WriteTxnMarkersRequest请求发送给TransactionId对应的partition,通过写marker的方式实现事务的最终的commit/abort。
+
+　　至此本篇的内容介绍完毕，后面可能有一篇补完，介绍KafkaProducer.sendOffsetsToTransaction()。
+
+## <a id="references">References</a>
+
+* http://www.infoq.com/cn/articles/kafka-analysis-part-8?utm_source=articles_about_Kafka&utm_medium=link&utm_campaign=Kafka#
