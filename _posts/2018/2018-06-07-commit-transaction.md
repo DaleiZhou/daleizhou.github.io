@@ -506,12 +506,7 @@ title: Kafka事务消息过程分析(三)
 
     // more code...
 
-    /**
-      * This is the call back invoked when a log append of transaction markers succeeds. This can be called multiple
-      * times when handling a single WriteTxnMarkersRequest because there is one append per TransactionMarker in the
-      * request, so there could be multiple appends of markers to the log. The final response will be sent only
-      * after all appends have returned.
-      */
+    // 会被多次调用，通过numAppends进行计数，最后一次调用sendResponseExemptThrottle()将结果发送回请求方
     def maybeSendResponseCallback(producerId: Long, result: TransactionResult)(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
       trace(s"End transaction marker append for producer id $producerId completed with status: $responseStatus")
       val currentErrors = new ConcurrentHashMap[TopicPartition, Errors](responseStatus.mapValues(_.error).asJava)
@@ -534,48 +529,21 @@ title: Kafka事务消息过程分析(三)
         }
       }
 
+      // 最后一次回调，将结果返回给请求WriteTxnMarkersRequest的调用broker
       if (numAppends.decrementAndGet() == 0)
         sendResponseExemptThrottle(request, new WriteTxnMarkersResponse(errors))
     }
 
-    // TODO: The current append API makes doing separate writes per producerId a little easier, but it would
-    // be nice to have only one append to the log. This requires pushing the building of the control records
-    // into Log so that we only append those having a valid producer epoch, and exposing a new appendControlRecord
-    // API in ReplicaManager. For now, we've done the simpler approach
     var skippedMarkers = 0
+    // 每个marker请求写入一次log
     for (marker <- markers.asScala) {
-      val producerId = marker.producerId
-      val partitionsWithCompatibleMessageFormat = new mutable.ArrayBuffer[TopicPartition]
-
-      val currentErrors = new ConcurrentHashMap[TopicPartition, Errors]()
-      marker.partitions.asScala.foreach { partition =>
-        replicaManager.getMagic(partition) match {
-          case Some(magic) =>
-            if (magic < RecordBatch.MAGIC_VALUE_V2)
-              currentErrors.put(partition, Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT)
-            else
-              partitionsWithCompatibleMessageFormat += partition
-          case None =>
-            currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-        }
-      }
-
-      if (!currentErrors.isEmpty)
-        updateErrors(producerId, currentErrors)
-
-      if (partitionsWithCompatibleMessageFormat.isEmpty) {
-        numAppends.decrementAndGet()
-        skippedMarkers += 1
-      } else {
+      // more code ...
+      else {
         val controlRecords = partitionsWithCompatibleMessageFormat.map { partition =>
-          val controlRecordType = marker.transactionResult match {
-            case TransactionResult.COMMIT => ControlRecordType.COMMIT
-            case TransactionResult.ABORT => ControlRecordType.ABORT
-          }
-          val endTxnMarker = new EndTransactionMarker(controlRecordType, marker.coordinatorEpoch)
-          partition -> MemoryRecords.withEndTransactionMarker(producerId, marker.producerEpoch, endTxnMarker)
+          //构造controlRecords
         }.toMap
 
+        //将controlRecords写入日志，DelayedProduce，主从同步
         replicaManager.appendRecords(
           timeout = config.requestTimeoutMs.toLong,
           requiredAcks = -1,
@@ -586,14 +554,8 @@ title: Kafka事务消息过程分析(三)
       }
     }
 
-    // No log appends were written as all partitions had incorrect log format
-    // so we need to send the error response
-    if (skippedMarkers == markers.size())
-      sendResponseExemptThrottle(request, new WriteTxnMarkersResponse(errors))
+    //more code ...
   }
-
-
-
 ```
 
 ### TBD
