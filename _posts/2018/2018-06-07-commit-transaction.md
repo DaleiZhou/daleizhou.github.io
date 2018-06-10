@@ -243,7 +243,61 @@ title: Kafka事务消息过程分析(三)
 
 　　txnManager.appendTransactionToLog()这个方法之前篇幅中已经见过，所做的处理大致总结为根据输入参数生成record,写入分区log中，更新本地缓存状态，返回正常/异常结果等。这里不做更详细的阐述，我们只需要知道handleEndTransaction()中生成的newMetadata被写入分区log中，并完成主从同步后调用sendTxnMarkersCallback()返回结果给客户端及开启发送TxnMarkers流程。
 
+```scala
+// TransactionMarkerChannelManager.scala
+  def addTxnMarkersToSend(transactionalId: String,
+                          coordinatorEpoch: Int,
+                          txnResult: TransactionResult,
+                          txnMetadata: TransactionMetadata,
+                          newMetadata: TxnTransitMetadata): Unit = {
 
+    def appendToLogCallback(error: Errors): Unit = {
+      error match {
+        case Errors.NONE =>
+          trace(s"Completed sending transaction markers for $transactionalId as $txnResult")
+
+          txnStateManager.getTransactionState(transactionalId) match {
+            case Left(Errors.NOT_COORDINATOR) =>
+              info(s"No longer the coordinator for $transactionalId with coordinator epoch $coordinatorEpoch; cancel appending $newMetadata to transaction log")
+
+            case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
+              info(s"Loading the transaction partition that contains $transactionalId while my current coordinator epoch is $coordinatorEpoch; " +
+                s"so cancel appending $newMetadata to transaction log since the loading process will continue the remaining work")
+
+            case Left(unexpectedError) =>
+              throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
+
+            case Right(Some(epochAndMetadata)) =>
+              if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
+                debug(s"Sending $transactionalId's transaction markers for $txnMetadata with coordinator epoch $coordinatorEpoch succeeded, trying to append complete transaction log now")
+
+                tryAppendToLog(TxnLogAppend(transactionalId, coordinatorEpoch, txnMetadata, newMetadata))
+              } else {
+                info(s"The cached metadata $txnMetadata has changed to $epochAndMetadata after completed sending the markers with coordinator " +
+                  s"epoch $coordinatorEpoch; abort transiting the metadata to $newMetadata as it may have been updated by another process")
+              }
+
+            case Right(None) =>
+              val errorMsg = s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
+                s"no metadata in the cache; this is not expected"
+              fatal(errorMsg)
+              throw new IllegalStateException(errorMsg)
+          }
+
+        case other =>
+          val errorMsg = s"Unexpected error ${other.exceptionName} before appending to txn log for $transactionalId"
+          fatal(errorMsg)
+          throw new IllegalStateException(errorMsg)
+      }
+    }
+
+    //构造一个DelayedTxnMarker，用于
+    val delayedTxnMarker = new DelayedTxnMarker(txnMetadata, appendToLogCallback, txnStateManager.stateReadLock)
+    txnMarkerPurgatory.tryCompleteElseWatch(delayedTxnMarker, Seq(transactionalId))
+
+    addTxnMarkersToBrokerQueue(transactionalId, txnMetadata.producerId, txnMetadata.producerEpoch, txnResult, coordinatorEpoch, txnMetadata.topicPartitions.toSet)
+  }
+```
 
 
 
