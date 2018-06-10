@@ -314,6 +314,286 @@ title: Kafka事务消息过程分析(三)
   }
 ```
 
+　　Broker之间的通信类似于客户端到broker的通信，broker的后台也会有专门的发送线程进行相互之间的通信。InterBrokerSendThread即为Kafka的broker之间通信后台线程，并使用非阻塞的NetworkClient作为网络通信的clinet。broker间的网络通信处理过程，请求的合并批量发送类似于producer到broker通信的处理过程。
+
+　　这里不具体细化展开addMarkersForBroker()后后台线程的处理过程。这里直接看到TransactionMarkerChannelManager.drainQueuedTransactionMarkers()中根据缓存队列中的txnMarkerEntry构造了TransactionMarkerRequestCompletionHandler及RequestAndCompletionHandler。这里屏蔽网络通信，后台处理的细节，我们直接看TransactionMarkerRequestCompletionHandler的onComplete()方法。
+
+```scala
+//TransactionMarkerRequestCompletionHandler.scala
+  override def onComplete(response: ClientResponse): Unit = {
+    val requestHeader = response.requestHeader
+    val correlationId = requestHeader.correlationId
+    if (response.wasDisconnected) {
+      trace(s"Cancelled request with header $requestHeader due to node ${response.destination} being disconnected")
+
+      for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
+        val transactionalId = txnIdAndMarker.txnId
+        val txnMarker = txnIdAndMarker.txnMarkerEntry
+
+        txnStateManager.getTransactionState(transactionalId) match {
+
+          case Left(Errors.NOT_COORDINATOR) =>
+            info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
+
+            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+
+          case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
+            info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
+              s"cancel sending transaction markers $txnMarker to the brokers")
+
+            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+
+          case Left(unexpectedError) =>
+            throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
+
+          case Right(None) =>
+            throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
+              s"no metadata in the cache; this is not expected")
+
+          case Right(Some(epochAndMetadata)) =>
+            if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
+              // coordinator epoch has changed, just cancel it from the purgatory
+              info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
+                s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
+
+              txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+            } else {
+              // re-enqueue the markers with possibly new destination brokers
+              trace(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
+                s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
+
+              txnMarkerChannelManager.addTxnMarkersToBrokerQueue(transactionalId,
+                txnMarker.producerId,
+                txnMarker.producerEpoch,
+                txnMarker.transactionResult,
+                txnMarker.coordinatorEpoch,
+                txnMarker.partitions.asScala.toSet)
+            }
+        }
+      }
+    } else {
+      debug(s"Received WriteTxnMarker response $response from node ${response.destination} with correlation id $correlationId")
+
+      val writeTxnMarkerResponse = response.responseBody.asInstanceOf[WriteTxnMarkersResponse]
+
+      for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
+        val transactionalId = txnIdAndMarker.txnId
+        val txnMarker = txnIdAndMarker.txnMarkerEntry
+        val errors = writeTxnMarkerResponse.errors(txnMarker.producerId)
+
+        if (errors == null)
+          throw new IllegalStateException(s"WriteTxnMarkerResponse does not contain expected error map for producer id ${txnMarker.producerId}")
+
+        txnStateManager.getTransactionState(transactionalId) match {
+          case Left(Errors.NOT_COORDINATOR) =>
+            info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
+
+            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+
+          case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
+            info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
+              s"cancel sending transaction markers $txnMarker to the brokers")
+
+            txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+
+          case Left(unexpectedError) =>
+            throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
+
+          case Right(None) =>
+            throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
+              s"no metadata in the cache; this is not expected")
+
+          case Right(Some(epochAndMetadata)) =>
+            val txnMetadata = epochAndMetadata.transactionMetadata
+            val retryPartitions: mutable.Set[TopicPartition] = mutable.Set.empty[TopicPartition]
+            var abortSending: Boolean = false
+
+            if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
+              // coordinator epoch has changed, just cancel it from the purgatory
+              info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
+                s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
+
+              txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+              abortSending = true
+            } else {
+              txnMetadata.inLock {
+                for ((topicPartition, error) <- errors.asScala) {
+                  error match {
+                    case Errors.NONE =>
+                      txnMetadata.removePartition(topicPartition)
+
+                    case Errors.CORRUPT_MESSAGE |
+                         Errors.MESSAGE_TOO_LARGE |
+                         Errors.RECORD_LIST_TOO_LARGE |
+                         Errors.INVALID_REQUIRED_ACKS => // these are all unexpected and fatal errors
+
+                      throw new IllegalStateException(s"Received fatal error ${error.exceptionName} while sending txn marker for $transactionalId")
+
+                    case Errors.UNKNOWN_TOPIC_OR_PARTITION |
+                         Errors.NOT_LEADER_FOR_PARTITION |
+                         Errors.NOT_ENOUGH_REPLICAS |
+                         Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND |
+                         Errors.REQUEST_TIMED_OUT => // these are retriable errors
+
+                      info(s"Sending $transactionalId's transaction marker for partition $topicPartition has failed with error ${error.exceptionName}, retrying " +
+                        s"with current coordinator epoch ${epochAndMetadata.coordinatorEpoch}")
+
+                      retryPartitions += topicPartition
+
+                    case Errors.INVALID_PRODUCER_EPOCH |
+                         Errors.TRANSACTION_COORDINATOR_FENCED => // producer or coordinator epoch has changed, this txn can now be ignored
+
+                      info(s"Sending $transactionalId's transaction marker for partition $topicPartition has permanently failed with error ${error.exceptionName} " +
+                        s"with the current coordinator epoch ${epochAndMetadata.coordinatorEpoch}; cancel sending any more transaction markers $txnMarker to the brokers")
+
+                      txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
+                      abortSending = true
+
+                    case Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT |
+                         Errors.UNSUPPORTED_VERSION =>
+                      // The producer would have failed to send data to the failed topic so we can safely remove the partition
+                      // from the set waiting for markers
+                      info(s"Sending $transactionalId's transaction marker from partition $topicPartition has failed with " +
+                        s" ${error.name}. This partition will be removed from the set of partitions" +
+                        s" waiting for completion")
+                      txnMetadata.removePartition(topicPartition)
+
+                    case other =>
+                      throw new IllegalStateException(s"Unexpected error ${other.exceptionName} while sending txn marker for $transactionalId")
+                  }
+                }
+              }
+            }
+
+            if (!abortSending) {
+              if (retryPartitions.nonEmpty) {
+                debug(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
+                  s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
+
+                // re-enqueue with possible new leaders of the partitions
+                txnMarkerChannelManager.addTxnMarkersToBrokerQueue(
+                  transactionalId,
+                  txnMarker.producerId,
+                  txnMarker.producerEpoch,
+                  txnMarker.transactionResult,
+                  txnMarker.coordinatorEpoch,
+                  retryPartitions.toSet)
+              } else {
+                txnMarkerChannelManager.completeSendMarkersForTxnId(transactionalId)
+              }
+            }
+        }
+      }
+    }
+  }
+```
+
+
+　　接下来我们看收到WriteTxnMarkersRequest的broker是如何处理该请求的。
+
+```scala
+  def handle(request: RequestChannel.Request) {
+        case ApiKeys.WRITE_TXN_MARKERS => handleWriteTxnMarkersRequest(request)
+   }
+
+  def handleWriteTxnMarkersRequest(request: RequestChannel.Request): Unit = {
+    ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
+    authorizeClusterAction(request)
+    val writeTxnMarkersRequest = request.body[WriteTxnMarkersRequest]
+    val errors = new ConcurrentHashMap[java.lang.Long, util.Map[TopicPartition, Errors]]()
+    val markers = writeTxnMarkersRequest.markers
+    val numAppends = new AtomicInteger(markers.size)
+
+    // more code...
+
+    /**
+      * This is the call back invoked when a log append of transaction markers succeeds. This can be called multiple
+      * times when handling a single WriteTxnMarkersRequest because there is one append per TransactionMarker in the
+      * request, so there could be multiple appends of markers to the log. The final response will be sent only
+      * after all appends have returned.
+      */
+    def maybeSendResponseCallback(producerId: Long, result: TransactionResult)(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
+      trace(s"End transaction marker append for producer id $producerId completed with status: $responseStatus")
+      val currentErrors = new ConcurrentHashMap[TopicPartition, Errors](responseStatus.mapValues(_.error).asJava)
+      updateErrors(producerId, currentErrors)
+      val successfulOffsetsPartitions = responseStatus.filter { case (topicPartition, partitionResponse) =>
+        topicPartition.topic == GROUP_METADATA_TOPIC_NAME && partitionResponse.error == Errors.NONE
+      }.keys
+
+      if (successfulOffsetsPartitions.nonEmpty) {
+        // as soon as the end transaction marker has been written for a transactional offset commit,
+        // call to the group coordinator to materialize the offsets into the cache
+        try {
+          groupCoordinator.scheduleHandleTxnCompletion(producerId, successfulOffsetsPartitions, result)
+        } catch {
+          case e: Exception =>
+            error(s"Received an exception while trying to update the offsets cache on transaction marker append", e)
+            val updatedErrors = new ConcurrentHashMap[TopicPartition, Errors]()
+            successfulOffsetsPartitions.foreach(updatedErrors.put(_, Errors.UNKNOWN_SERVER_ERROR))
+            updateErrors(producerId, updatedErrors)
+        }
+      }
+
+      if (numAppends.decrementAndGet() == 0)
+        sendResponseExemptThrottle(request, new WriteTxnMarkersResponse(errors))
+    }
+
+    // TODO: The current append API makes doing separate writes per producerId a little easier, but it would
+    // be nice to have only one append to the log. This requires pushing the building of the control records
+    // into Log so that we only append those having a valid producer epoch, and exposing a new appendControlRecord
+    // API in ReplicaManager. For now, we've done the simpler approach
+    var skippedMarkers = 0
+    for (marker <- markers.asScala) {
+      val producerId = marker.producerId
+      val partitionsWithCompatibleMessageFormat = new mutable.ArrayBuffer[TopicPartition]
+
+      val currentErrors = new ConcurrentHashMap[TopicPartition, Errors]()
+      marker.partitions.asScala.foreach { partition =>
+        replicaManager.getMagic(partition) match {
+          case Some(magic) =>
+            if (magic < RecordBatch.MAGIC_VALUE_V2)
+              currentErrors.put(partition, Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT)
+            else
+              partitionsWithCompatibleMessageFormat += partition
+          case None =>
+            currentErrors.put(partition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+        }
+      }
+
+      if (!currentErrors.isEmpty)
+        updateErrors(producerId, currentErrors)
+
+      if (partitionsWithCompatibleMessageFormat.isEmpty) {
+        numAppends.decrementAndGet()
+        skippedMarkers += 1
+      } else {
+        val controlRecords = partitionsWithCompatibleMessageFormat.map { partition =>
+          val controlRecordType = marker.transactionResult match {
+            case TransactionResult.COMMIT => ControlRecordType.COMMIT
+            case TransactionResult.ABORT => ControlRecordType.ABORT
+          }
+          val endTxnMarker = new EndTransactionMarker(controlRecordType, marker.coordinatorEpoch)
+          partition -> MemoryRecords.withEndTransactionMarker(producerId, marker.producerEpoch, endTxnMarker)
+        }.toMap
+
+        replicaManager.appendRecords(
+          timeout = config.requestTimeoutMs.toLong,
+          requiredAcks = -1,
+          internalTopicsAllowed = true,
+          isFromClient = false,
+          entriesPerPartition = controlRecords,
+          responseCallback = maybeSendResponseCallback(producerId, marker.transactionResult))
+      }
+    }
+
+    // No log appends were written as all partitions had incorrect log format
+    // so we need to send the error response
+    if (skippedMarkers == markers.size())
+      sendResponseExemptThrottle(request, new WriteTxnMarkersResponse(errors))
+  }
 
 
 
+```
+
+### TBD
