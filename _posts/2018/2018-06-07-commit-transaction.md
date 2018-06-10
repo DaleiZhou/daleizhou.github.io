@@ -444,7 +444,7 @@ title: Kafka事务消息过程分析(三)
 
 ## <a id="conclusion">总结</a>
 
-　　本篇介绍了Producer对事务的commit/abort的具体执行过程。Kafka的事务的本质是对Offset进行标记相同的Transaction Marker来实现事务的读写操作，通过Marker是否写入实现对事物的隔离。KafkaProducer对事务的提交EndTxnHandler提交给对应的Coordinator，Coordinator将record写入log中并完成主从同步，接着会通过broker内部线程，主动产生一个WriteTxnMarkersRequest请求发送给TransactionId对应的partition,通过写marker的方式实现事务的最终的commit/abort。
+　　本篇介绍了Producer对事务的commit/abort的具体执行过程。Kafka的事务的本质是对Offset进行标记相同的Transaction Marker来实现事务的读写操作，通过Marker是否写入实现对事务的隔离。KafkaProducer对事务的提交EndTxnHandler提交给对应的Coordinator，Coordinator将record写入log中并完成主从同步，接着会通过broker内部线程，主动产生一个WriteTxnMarkersRequest请求发送给TransactionId对应的partition,通过写marker的方式实现事务的最终的commit/abort。
 
 　　至此本篇的内容介绍完毕，后面可能有一篇补完，介绍KafkaProducer.sendOffsetsToTransaction()。
 
