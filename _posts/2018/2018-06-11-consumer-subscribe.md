@@ -456,6 +456,7 @@ title: Kafka Consumer(一)
           }
 
         case Some(group) =>
+          // 实际的doJoinGroup  
           doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
       }
     }
@@ -476,66 +477,11 @@ title: Kafka Consumer(一)
         group.currentState match {
           // other code ...
 
-          case PreparingRebalance =>
-            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
-              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
-                protocols, group, responseCallback)
-            } else {
-              val member = group.get(memberId)
-              updateMemberAndRebalance(group, member, protocols, responseCallback)
-            }
-
-          case CompletingRebalance =>
-            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
-              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
-                protocols, group, responseCallback)
-            } else {
-              val member = group.get(memberId)
-              if (member.matches(protocols)) {
-                // member is joining with the same metadata (which could be because it failed to
-                // receive the initial JoinGroup response), so just return current group information
-                // for the current generation.
-                responseCallback(JoinGroupResult(
-                  members = if (group.isLeader(memberId)) {
-                    group.currentMemberMetadata
-                  } else {
-                    Map.empty
-                  },
-                  memberId = memberId,
-                  generationId = group.generationId,
-                  subProtocol = group.protocolOrNull,
-                  leaderId = group.leaderOrNull,
-                  error = Errors.NONE))
-              } else {
-                // member has changed metadata, so force a rebalance
-                updateMemberAndRebalance(group, member, protocols, responseCallback)
-              }
-            }
-
-          case Empty | Stable =>
-            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
-              // if the member id is unknown, register the member to the group
-              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
-                protocols, group, responseCallback)
-            } else {
-              val member = group.get(memberId)
-              if (group.isLeader(memberId) || !member.matches(protocols)) {
-                // force a rebalance if a member has changed metadata or if the leader sends JoinGroup.
-                // The latter allows the leader to trigger rebalances for changes affecting assignment
-                // which do not affect the member metadata (such as topic metadata changes for the consumer)
-                updateMemberAndRebalance(group, member, protocols, responseCallback)
-              } else {
-                // for followers with no actual change to their metadata, just return group information
-                // for the current generation which will allow them to issue SyncGroup
-                responseCallback(JoinGroupResult(
-                  members = Map.empty,
-                  memberId = memberId,
-                  generationId = group.generationId,
-                  subProtocol = group.protocolOrNull,
-                  leaderId = group.leaderOrNull,
-                  error = Errors.NONE))
-              }
-            }
+          // 各种状态和是否是新加入的menber进行不同的处理
+          // 主要的处理方法有
+          // 1. 新加入的member:addMemberAndRebalance()
+          // 2. 已有member更新：updateMemberAndRebalance()
+          case  =>
         }
 
         if (group.is(PreparingRebalance))
@@ -543,7 +489,116 @@ title: Kafka Consumer(一)
       }
     }
   }
+
+  private def addMemberAndRebalance(rebalanceTimeoutMs: Int,
+                                    sessionTimeoutMs: Int,
+                                    clientId: String,
+                                    clientHost: String,
+                                    protocolType: String,
+                                    protocols: List[(String, Array[Byte])],
+                                    group: GroupMetadata,
+                                    callback: JoinCallback) = {
+    val memberId = clientId + "-" + group.generateMemberIdSuffix
+    val member = new MemberMetadata(memberId, group.groupId, clientId, clientHost, rebalanceTimeoutMs,
+      sessionTimeoutMs, protocolType, protocols)
+    member.awaitingJoinCallback = callback
+    // update the newMemberAdded flag to indicate that the join group can be further delayed
+    if (group.is(PreparingRebalance) && group.generationId == 0)
+      group.newMemberAdded = true
+
+    //group的add()方法用于将member加入GroupMeta的members缓存中
+    // 如果此时没有leader，则现在加入的member就成为了leader
+    group.add(member)
+    maybePrepareRebalance(group)
+    member
+  }
+
+  private def updateMemberAndRebalance(group: GroupMetadata,
+                                       member: MemberMetadata,
+                                       protocols: List[(String, Array[Byte])],
+                                       callback: JoinCallback) {
+    // 更新缓存信息
+    member.supportedProtocols = protocols
+    member.awaitingJoinCallback = callback
+    maybePrepareRebalance(group)
+  }
+
+  private def maybePrepareRebalance(group: GroupMetadata) {
+    group.inLock {
+      // 如果此时状态已经为Stable, CompletingRebalance, Empty则执行prepareRebalance()
+      if (group.canRebalance)
+        prepareRebalance(group)
+    }
+  }
+
+  private def prepareRebalance(group: GroupMetadata) {
+    // 如果有member在等待sync操作，返回REBALANCE_IN_PROGRESS，客户端会再次sync获取rebalance后的分配信息
+    if (group.is(CompletingRebalance))
+      resetAndPropagateAssignmentError(group, Errors.REBALANCE_IN_PROGRESS)
+
+    // 根据group状态不同设置不同的DelayedJoin操作
+    // 从Empty到PreparingRebalance时设置InitialDelayedJoin
+    //
+    val delayedRebalance = if (group.is(Empty))
+      new InitialDelayedJoin(this,
+        joinPurgatory,
+        group,
+        groupConfig.groupInitialRebalanceDelayMs,
+        groupConfig.groupInitialRebalanceDelayMs,
+        max(group.rebalanceTimeoutMs - groupConfig.groupInitialRebalanceDelayMs, 0))
+    else
+      new DelayedJoin(this, group, group.rebalanceTimeoutMs)
+
+    //将状态置为PreparingRebalance
+    group.transitionTo(PreparingRebalance)
+
+    val groupKey = GroupKey(group.groupId)
+    joinPurgatory.tryCompleteElseWatch(delayedRebalance, Seq(groupKey))
+  }
+
+  //DelayedJoin操作成功时会调用onCompleteJoin()完成join操作
+  def onCompleteJoin(group: GroupMetadata) {
+    group.inLock {
+      // remove any members who haven't joined the group yet
+      group.notYetRejoinedMembers.foreach { failedMember =>
+        group.remove(failedMember.memberId)
+        // TODO: cut the socket connection to the client
+      }
+
+      if (!group.is(Dead)) {
+        //更新下一个generation值，设置group状态
+        group.initNextGeneration()
+        if (group.is(Empty)) {
+          // other code ...
+        } else {
+          // 触发所有等待join group的回调方法，将结果返回给所有的member
+          for (member <- group.allMemberMetadata) {
+            assert(member.awaitingJoinCallback != null)
+            val joinResult = JoinGroupResult(
+              // 如果当前member为leader，将整个group的member信息返回
+              members = if (group.isLeader(member.memberId)) {
+                group.currentMemberMetadata
+              } else {
+                Map.empty
+              },
+              memberId = member.memberId,
+              generationId = group.generationId,
+              subProtocol = group.protocolOrNull,
+              leaderId = group.leaderOrNull,
+              error = Errors.NONE)
+
+            member.awaitingJoinCallback(joinResult)
+            member.awaitingJoinCallback = null
+            //rebalance期间心跳功能已经暂停，延长心跳超时检测
+            completeAndScheduleNextHeartbeatExpiration(group, member)
+          }
+        }
+      }
+    }
+  }
 ```
+
+　　如果Group当前的leader为空，则现在加入的member自动为leader。onCompleteJoin方法为rebalance成功后触发的操作。该方法中，在返回给客户端结果时做了是否为leader的区分，如果是leader则返回所有member的信息，否则member信息为空。而leader收到JoinGroup返回后，则会通过获取到的member信息与topicpartition进行关联分配，通过SyncGroupRequest又发回给服务端。
 
 **SyncGroupRequest**
 
