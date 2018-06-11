@@ -119,7 +119,7 @@ title: KafkaConsumer(一)
 
 　　其实通过Topic和Pattern进行主题的订阅是相似的，形式上的区别是一个直接指明主题列表，一个是通过Pattern的方式指定，另一个重要区别是通过Pattern方式的订阅，会在订阅动作完成后，如果有新的符合Pattern的主题的加入，则会更新订阅列表将其加入进来。
 
-## <a id="subscribe">subscribe</a>
+## <a id="assign">assign</a>
 
 　　kafka提供了另一种订阅模式:assign模式。这是一种由用户手工分配TopicPartition列表的非增量订阅模式。从实现上，assign模式不会使用Consumer Group的管理功能，因此如果consumer group的成员、cluster和topic metadata更新都不会触发rebalance操作，需要用户自行处理。
 
@@ -146,6 +146,7 @@ title: KafkaConsumer(一)
                 // 在设置新的assign时，如果客户端开启了auto-commit，则旧的assign的异步commit需要全部提交
                 this.coordinator.maybeAutoCommitOffsetsAsync(time.milliseconds());
 
+                // 更新assignment，设定用户指定的partitions
                 this.subscriptions.assignFromUser(new HashSet<>(partitions));
                 metadata.setTopics(topics);
             }
@@ -154,6 +155,115 @@ title: KafkaConsumer(一)
         }
     }
 ```
+
+　　KafkaConsumer.assign()方法调用了subscriptions.assignFromUser()进行手工设定assignment。另一种设定方式为assignFromSubscribed，这个将在后面讲解poll()时出现。使用subscribe和assign模式订阅消息的一个重要区别体现在GroupCoordinator是否可以感知管理这个Consumer实例。带着这样的问题我们来看Consumer在订阅主题之后是如何进行消息消费的。
+
+　　
+
+```java
+    //KaflaConsumer.java
+    // 传入timeout, 循环拉取数据，如果超时还是没有数据，则抛出异常
+    public ConsumerRecords<K, V> poll(long timeout) {
+        acquireAndEnsureOpen();
+        try {
+            // more code ...
+
+            do {
+                //单次的拉取
+                Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollOnce(remaining);
+                if (!records.isEmpty()) {
+                    // 如果拉取的记录不为empty,在返回给之前可以发送下一批的feitches请求，
+                    //这样下一轮pollOnce()操作可能直接取到结果,
+                    // 消息消费的位置已经发生了变化，在返回结果期间不允许weakup和做触发error的操作
+                    if (fetcher.sendFetches() > 0 || client.hasPendingRequests())
+                        client.pollNoWakeup();
+
+                    return this.interceptors.onConsume(new ConsumerRecords<>(records));
+                }
+
+                long elapsed = time.milliseconds() - start;
+                remaining = timeout - elapsed;
+            } while (remaining > 0);
+
+            return ConsumerRecords.empty();
+        } finally {
+            release();
+        }
+    }
+
+    private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollOnce(long timeout) {
+        client.maybeTriggerWakeup();
+
+        long startMs = time.milliseconds();
+        // poll coordinator消息进行一些管理工作，如果是使用subscribe方式订阅，需要知道coordinator及加入group, 这样才能消费消息
+    // 如果是通过assign模式订阅消息，则需要等待node可用及metadata的更新
+        // 并且如果是设置了auto-commit，则处理offset的commit
+        coordinator.poll(startMs, timeout);
+
+        // 更新partition的fetch位置
+        boolean hasAllFetchPositions = updateFetchPositions();
+
+        // 因为在前几轮的pollOnce()中返回结果之前又sendFetches(),因此此时可能结果已经直接ready
+        Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
+        if (!records.isEmpty())
+            return records;
+
+        // 发送新的fetch请求，pending中的请求不会重发
+        fetcher.sendFetches();
+
+        // more code ...
+
+        client.poll(pollTimeout, nowMs, new PollCondition() {
+            @Override
+            public boolean shouldBlock() {
+                // 如果有后台线程已经完成一个fetch请求，则不需要阻塞client
+                return !fetcher.hasCompletedFetches();
+            }
+        });
+
+        // 检查是否需要重新负载均衡
+        if (coordinator.needRejoin())
+            return Collections.emptyMap();
+
+        return fetcher.fetchedRecords();
+    }
+```
+
+　　上述代码中，kafkaConsumer.pollOnce()中在构造请求，获取结果前调用了coordinator.poll()方法来poll coordnator事件。
+
+```java
+    // ConsumerCoordinator.java
+    public void poll(long now, long remainingMs) {
+        invokeCompletedOffsetCommitCallbacks();
+
+        if (subscriptions.partitionsAutoAssigned()) {
+            if (coordinatorUnknown()) {
+                ensureCoordinatorReady();
+                now = time.milliseconds();
+            }
+
+            if (needRejoin()) {
+                if (subscriptions.hasPatternSubscription())
+                    client.ensureFreshMetadata();
+
+                ensureActiveGroup();
+                now = time.milliseconds();
+            }
+
+            pollHeartbeat(now);
+        } else {
+            if (metadata.updateRequested() && !client.hasReadyNodes()) {
+                boolean metadataUpdated = client.awaitMetadataUpdate(remainingMs);
+                if (!metadataUpdated && !client.hasReadyNodes())
+                    return;
+                now = time.milliseconds();
+            }
+        }
+
+        maybeAutoCommitOffsetsAsync(now);
+    }
+```
+
 
 
 ## TBD
