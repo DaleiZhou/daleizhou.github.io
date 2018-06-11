@@ -9,7 +9,7 @@ title: Kafka Consumer(一)
 
   代码版本: 2.0.0-SNAPSHOT, 涉及内容有subscribe, assign, join group
 
-　　从这篇开始从KafkaConsumer为切入点，大概用四篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题的相关实现。
+　　从这篇开始从KafkaConsumer为切入点，大概用三篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题的相关实现。
 
 ## <a id="subscribe">subscribe</a>
 
@@ -422,7 +422,7 @@ title: Kafka Consumer(一)
   }
 ```
 
-　　GroupCoordinator.handleJoinGroup()
+　　GroupCoordinator.handleJoinGroup()做了实际的join group的工作，具体工作大致可以概括为创建新的group,根据状态及group实际内容执行不同的join策略。具体代码如下:
 
 ```scala
   // GroupCoordinator.scala
@@ -545,9 +545,9 @@ title: Kafka Consumer(一)
   }
 ```
 
-    
-
 **SyncGroupRequest**
+
+　　客户端join一个group后会发送SyncGroupRequest进行请求group的分配信息。一个Group中的consumer有两种角色：leader和follow。leader会在SyncGroupRequest时带上经过运算等到的分配情况，而follow发送的SyncGroupReques发送的assign为空信息。Broker端根据是否为leader会进行不同的处理，相同的是最后会返回该group对应的assign信息，具体处理过程如下:
 
 ```scala
   //KafkaApis.scala 
@@ -576,6 +576,8 @@ title: Kafka Consumer(一)
     }
   }
 ```
+
+　　GroupCoordinator.handleSyncGroup()方法经过一系列的异常条件判断后，正常执行doSyncGroup(),根据传入的参数完成具体的syncGroup实际的工作。
 
 ```scala
   //GroupCoordinator.scala
@@ -622,14 +624,13 @@ title: Kafka Consumer(一)
               //storeGroup()主要是构造主题为 __consumer_offsets 的内部消息，写入log并完成主从同步操作
               groupManager.storeGroup(group, assignment, (error: Errors) => {
                 group.inLock {
-                  // another member may have joined the group while we were awaiting this callback,
-                  // so we must ensure we are still in the CompletingRebalance state and the same generation
-                  // when it gets invoked. if we have transitioned to another state, then do nothing
+                  // 等待stroeGroup完成回调这个匿名回调方法期间可能有别的consumerjoin进来。因此我们需要检查是否还处于预期的状态和年代内，如果不是则什么都不做，客户端根据不同情况自行处理，重新进行join等
                   if (group.is(CompletingRebalance) && generationId == group.generationId) {
                     if (error != Errors.NONE) {
                       resetAndPropagateAssignmentError(group, error)
                       maybePrepareRebalance(group)
                     } else {
+                      //根据leader的assignment更新缓存并返回leader的assign  
                       setAndPropagateAssignment(group, assignment)
                       group.transitionTo(Stable)
                     }
@@ -652,7 +653,9 @@ title: Kafka Consumer(一)
 
 ## <a id="conclusion">总结</a>
 
-　　本篇介绍了。
+　　本篇从KafkaConsumer消费消息为切入点，介绍了两种订阅模式：subscribe和assign模式。而subscribe模式会在poll消息时决定是否触发加入group操作，进行rebalance动作。在Join的过程中总共会产生FindCoordinatorRequest，JoinGroupRequest以及SyncGroupRequest的请求。本文的后半节介绍了这几个请求客户端与服务端处理的具体过程。
+
+　　下一篇继续从KafkaConsumer.poll()切入，分析学习消息的具体消费过程。
 
 ## <a id="references">References</a>
 
