@@ -467,17 +467,8 @@ title: Kafka Consumer(一)
                           protocols: List[(String, Array[Byte])],
                           responseCallback: JoinCallback) {
     group.inLock {
-      if (!group.is(Empty) && (!group.protocolType.contains(protocolType) || !group.supportsProtocols(protocols.map(_._1).toSet))) {
-        // if the new member does not support the group protocol, reject it
-        responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
-      } else if (group.is(Empty) && (protocols.isEmpty || protocolType.isEmpty)) {
-        //reject if first member with empty group protocol or protocolType is empty
-        responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
-      } else if (memberId != JoinGroupRequest.UNKNOWN_MEMBER_ID && !group.has(memberId)) {
-        // if the member trying to register with a un-recognized id, send the response to let
-        // it reset its member id and retry
-        responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
-      } else {
+       // 异常处理...
+       else {
         group.currentState match {
           case Dead =>
             // if the group is marked as dead, it means some other thread has just removed the group
@@ -556,6 +547,116 @@ title: Kafka Consumer(一)
 
 **SyncGroupRequest**
 
+```scala
+  //KafkaApis.scala 
+  def handle(request: RequestChannel.Request) {
+        case ApiKeys.SYNC_GROUP => handleSyncGroupRequest(request)
+  }
+
+  def handleSyncGroupRequest(request: RequestChannel.Request) {
+    val syncGroupRequest = request.body[SyncGroupRequest]
+
+    def sendResponseCallback(memberState: Array[Byte], error: Errors) {
+      sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new SyncGroupResponse(requestThrottleMs, error, ByteBuffer.wrap(memberState)))
+    }
+
+    if (!authorize(request.session, Read, new Resource(Group, syncGroupRequest.groupId()))) {
+      sendResponseCallback(Array[Byte](), Errors.GROUP_AUTHORIZATION_FAILED)
+    } else {
+      groupCoordinator.handleSyncGroup(
+        syncGroupRequest.groupId,
+        syncGroupRequest.generationId,
+        syncGroupRequest.memberId,
+        syncGroupRequest.groupAssignment().asScala.mapValues(Utils.toArray),
+        sendResponseCallback
+      )
+    }
+  }
+```
+
+```scala
+  //GroupCoordinator.scala
+  def handleSyncGroup(groupId: String,
+                      generation: Int,
+                      memberId: String,
+                      groupAssignment: Map[String, Array[Byte]],
+                      responseCallback: SyncCallback): Unit = {
+    validateGroupStatus(groupId, ApiKeys.SYNC_GROUP) match {
+      case Some(error) if error == Errors.COORDINATOR_LOAD_IN_PROGRESS =>
+        // The coordinator is loading, which means we've lost the state of the active rebalance and the
+        // group will need to start over at JoinGroup. By returning rebalance in progress, the consumer
+        // will attempt to rejoin without needing to rediscover the coordinator. Note that we cannot
+        // return COORDINATOR_LOAD_IN_PROGRESS since older clients do not expect the error.
+        responseCallback(Array.empty, Errors.REBALANCE_IN_PROGRESS)
+
+      case Some(error) => responseCallback(Array.empty, error)
+
+      case None =>
+        groupManager.getGroup(groupId) match {
+          case None => responseCallback(Array.empty, Errors.UNKNOWN_MEMBER_ID)
+          case Some(group) => doSyncGroup(group, generation, memberId, groupAssignment, responseCallback)
+        }
+    }
+  }
+
+  private def doSyncGroup(group: GroupMetadata,
+                          generationId: Int,
+                          memberId: String,
+                          groupAssignment: Map[String, Array[Byte]],
+                          responseCallback: SyncCallback) {
+    group.inLock {
+      if (!group.has(memberId)) {
+        responseCallback(Array.empty, Errors.UNKNOWN_MEMBER_ID)
+      } else if (generationId != group.generationId) {
+        responseCallback(Array.empty, Errors.ILLEGAL_GENERATION)
+      } else {
+        group.currentState match {
+          case Empty | Dead =>
+            responseCallback(Array.empty, Errors.UNKNOWN_MEMBER_ID)
+
+          case PreparingRebalance =>
+            responseCallback(Array.empty, Errors.REBALANCE_IN_PROGRESS)
+
+          case CompletingRebalance =>
+            group.get(memberId).awaitingSyncCallback = responseCallback
+
+            // if this is the leader, then we can attempt to persist state and transition to stable
+            if (group.isLeader(memberId)) {
+              info(s"Assignment received from leader for group ${group.groupId} for generation ${group.generationId}")
+
+              // fill any missing members with an empty assignment
+              val missing = group.allMembers -- groupAssignment.keySet
+              val assignment = groupAssignment ++ missing.map(_ -> Array.empty[Byte]).toMap
+
+              groupManager.storeGroup(group, assignment, (error: Errors) => {
+                group.inLock {
+                  // another member may have joined the group while we were awaiting this callback,
+                  // so we must ensure we are still in the CompletingRebalance state and the same generation
+                  // when it gets invoked. if we have transitioned to another state, then do nothing
+                  if (group.is(CompletingRebalance) && generationId == group.generationId) {
+                    if (error != Errors.NONE) {
+                      resetAndPropagateAssignmentError(group, error)
+                      maybePrepareRebalance(group)
+                    } else {
+                      setAndPropagateAssignment(group, assignment)
+                      group.transitionTo(Stable)
+                    }
+                  }
+                }
+              })
+            }
+
+          case Stable =>
+            // if the group is stable, we just return the current assignment
+            val memberMetadata = group.get(memberId)
+            responseCallback(memberMetadata.assignment, Errors.NONE)
+            completeAndScheduleNextHeartbeatExpiration(group, group.get(memberId))
+        }
+      }
+    }
+  }
+```
 
 ## <a id="conclusion">总结</a>
 
