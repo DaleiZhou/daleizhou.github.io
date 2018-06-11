@@ -425,7 +425,7 @@ title: Kafka Consumer(一)
 　　GroupCoordinator.handleJoinGroup()
 
 ```scala
-  // groupCoordinator.scala
+  // GroupCoordinator.scala
   def handleJoinGroup(groupId: String,
                       memberId: String,
                       clientId: String,
@@ -441,7 +441,7 @@ title: Kafka Consumer(一)
       return
     }
 
-    //timeout...
+    // timeout handle...
     else {
       // 如不存在groupId，则创建group,
       // 通过doJoinGroup()将memberId加入已有或刚创建的group
@@ -450,6 +450,7 @@ title: Kafka Consumer(一)
           if (memberId != JoinGroupRequest.UNKNOWN_MEMBER_ID) {
             responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
           } else {
+            //新建一个组，状态初始化为Empty
             val group = groupManager.addGroup(new GroupMetadata(groupId, initialState = Empty))
             doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
           }
@@ -474,6 +475,7 @@ title: Kafka Consumer(一)
        else {
         group.currentState match {
           // other code ...
+
           case PreparingRebalance =>
             if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
               addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
@@ -543,6 +545,8 @@ title: Kafka Consumer(一)
   }
 ```
 
+    
+
 **SyncGroupRequest**
 
 ```scala
@@ -581,14 +585,7 @@ title: Kafka Consumer(一)
                       groupAssignment: Map[String, Array[Byte]],
                       responseCallback: SyncCallback): Unit = {
     validateGroupStatus(groupId, ApiKeys.SYNC_GROUP) match {
-      case Some(error) if error == Errors.COORDINATOR_LOAD_IN_PROGRESS =>
-        // The coordinator is loading, which means we've lost the state of the active rebalance and the
-        // group will need to start over at JoinGroup. By returning rebalance in progress, the consumer
-        // will attempt to rejoin without needing to rediscover the coordinator. Note that we cannot
-        // return COORDINATOR_LOAD_IN_PROGRESS since older clients do not expect the error.
-        responseCallback(Array.empty, Errors.REBALANCE_IN_PROGRESS)
-
-      case Some(error) => responseCallback(Array.empty, error)
+      // other code ...
 
       case None =>
         groupManager.getGroup(groupId) match {
@@ -610,23 +607,19 @@ title: Kafka Consumer(一)
         responseCallback(Array.empty, Errors.ILLEGAL_GENERATION)
       } else {
         group.currentState match {
-          case Empty | Dead =>
-            responseCallback(Array.empty, Errors.UNKNOWN_MEMBER_ID)
-
-          case PreparingRebalance =>
-            responseCallback(Array.empty, Errors.REBALANCE_IN_PROGRESS)
+          // error handle code ...
 
           case CompletingRebalance =>
             group.get(memberId).awaitingSyncCallback = responseCallback
 
-            // if this is the leader, then we can attempt to persist state and transition to stable
+            // 由leader去触发，完成CompletingRebalance到Stable状态转换
             if (group.isLeader(memberId)) {
-              info(s"Assignment received from leader for group ${group.groupId} for generation ${group.generationId}")
 
               // fill any missing members with an empty assignment
               val missing = group.allMembers -- groupAssignment.keySet
               val assignment = groupAssignment ++ missing.map(_ -> Array.empty[Byte]).toMap
 
+              //storeGroup()主要是构造主题为 __consumer_offsets 的内部消息，写入log并完成主从同步操作
               groupManager.storeGroup(group, assignment, (error: Errors) => {
                 group.inLock {
                   // another member may have joined the group while we were awaiting this callback,
@@ -646,9 +639,10 @@ title: Kafka Consumer(一)
             }
 
           case Stable =>
-            // if the group is stable, we just return the current assignment
+            // 如果状态处于stable，只需要根据menberId返回分配信息给客户端即可
             val memberMetadata = group.get(memberId)
             responseCallback(memberMetadata.assignment, Errors.NONE)
+            //因为在rebalance期间心跳暂停，重设menber对应的过期时间，根据新的过期时间监听该menberId心跳
             completeAndScheduleNextHeartbeatExpiration(group, group.get(memberId))
         }
       }
