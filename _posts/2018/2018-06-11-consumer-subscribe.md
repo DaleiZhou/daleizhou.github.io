@@ -307,6 +307,7 @@ title: Kafka Consumer(一)
             client.poll(future);
 
             if (future.succeeded()) {
+                //join成功后调用的方法，更新缓存，触发负载均衡后的回调
                 onJoinComplete(generation.generationId, generation.memberId, generation.protocol, future.value());
 
                 // join成功则重置本地变量
@@ -365,6 +366,8 @@ title: Kafka Consumer(一)
 　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，构造SyncGroupRequest放给服务端。如果作为follower加入，则发送回一个空的分配结果给服务端。
 
 　　作为leader进行分配的实现有很多种方式，都是直接或间接继承PartitionAssignor，重写assign()等方法，具体实现由如round,random，sticky等。
+
+　　Join成功后调用ConsumerCoordinator.onJoinComplete()方法，完成更新TopicPartition的订阅，metadata的更新，及执行用户定义的负载均衡后的回调方法。至此Consumer端完成join group的调用。
 
 ## <a id="KafkaApis">KafkaApis</a>
 
@@ -470,12 +473,7 @@ title: Kafka Consumer(一)
        // 异常处理...
        else {
         group.currentState match {
-          case Dead =>
-            // if the group is marked as dead, it means some other thread has just removed the group
-            // from the coordinator metadata; this is likely that the group has migrated to some other
-            // coordinator OR the group is in a transient unstable phase. Let the member retry
-            // joining without the specified member id,
-            responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+          // other code ...
           case PreparingRebalance =>
             if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
               addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
