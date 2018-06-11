@@ -156,9 +156,7 @@ title: KafkaConsumer(一)
     }
 ```
 
-　　KafkaConsumer.assign()方法调用了subscriptions.assignFromUser()进行手工设定assignment。另一种设定方式为assignFromSubscribed，这个将在后面讲解poll()时出现。使用subscribe和assign模式订阅消息的一个重要区别体现在GroupCoordinator是否可以感知管理这个Consumer实例。带着这样的问题我们来看Consumer在订阅主题之后是如何进行消息消费的。
-
-　　
+　　KafkaConsumer.assign()方法调用了subscriptions.assignFromUser()进行手工设定assignment。另一种设定方式为assignFromSubscribed，这个将在后面讲解poll()时出现。使用subscribe和assign模式订阅消息的一个重要区别体现在GroupCoordinator是否可以感知管理这个Consumer实例。带着这样的问题我们来看Consumer在订阅主题之后是如何进行消息消费的。入口从KafkaConsumer.poll()方法开始。
 
 ```java
     //KaflaConsumer.java
