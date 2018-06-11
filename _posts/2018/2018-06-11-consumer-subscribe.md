@@ -1,7 +1,7 @@
 ---
 layout: post
 category: Kafka
-title: KafkaConsumer(一)
+title: Kafka Consumer(一)
 ---
 
 ## 内容 
@@ -234,12 +234,17 @@ title: KafkaConsumer(一)
     public void poll(long now, long remainingMs) {
         invokeCompletedOffsetCommitCallbacks();
 
+        // AUTO_TOPICS || AUTO_PATTERN，即通过subscribe进行的主题订阅
         if (subscriptions.partitionsAutoAssigned()) {
+            // 这种模式下，需要保证coordinator处于ready状态
+            // 否则将通过发送查找GROUP类型的FindCoordinatorRequest进行查找并更新缓存信息
             if (coordinatorUnknown()) {
                 ensureCoordinatorReady();
                 now = time.milliseconds();
             }
 
+            //1.  AUTO_TOPICS || AUTO_PATTERN
+            //and 如果assignment有更新或者joinedSubscription有更新则进行rejoin过程
             if (needRejoin()) {
                 if (subscriptions.hasPatternSubscription())
                     client.ensureFreshMetadata();
@@ -258,6 +263,7 @@ title: KafkaConsumer(一)
             }
         }
 
+        // 周期性地进行offset的commit
         maybeAutoCommitOffsetsAsync(now);
     }
 ```
