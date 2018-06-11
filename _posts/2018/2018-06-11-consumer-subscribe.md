@@ -7,7 +7,7 @@ title: Kafka Consumer(一)
 ## 内容 
 >Status: Draft
 
-  代码版本: 2.0.0-SNAPSHOT
+  代码版本: 2.0.0-SNAPSHOT, 涉及内容有subscribe, assign, join group
 
 　　从这篇开始从KafkaConsumer为切入点，大概用四篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题的相关实现。
 
@@ -227,7 +227,11 @@ title: Kafka Consumer(一)
     }
 ```
 
-　　上述代码中，kafkaConsumer.pollOnce()中在构造请求，获取结果前调用了coordinator.poll()方法来poll coordnator事件。
+　　上述代码中，kafkaConsumer.pollOnce()中在构造请求，获取结果前调用了coordinator.poll()方法来poll coordnator事件。该过程完成了Group的查找，加入一个Group，发送心跳数据，更新metadata,周期性的提交offset等处理。这篇文章的后面部分着重介绍这个过程的客户端与服务端的交互细节。
+
+## <a id="ConsumerCoordinator.poll">ConsumerCoordinator.poll</a>
+
+　　下面是ConsumerCoordinator.poll()方法的代码细节。
 
 ```java
     // ConsumerCoordinator.java
@@ -247,12 +251,14 @@ title: Kafka Consumer(一)
             //and 如果assignment有更新或者joinedSubscription有更新则进行rejoin过程
             if (needRejoin()) {
                 if (subscriptions.hasPatternSubscription())
+                    //join前需要保证metadata更新完
                     client.ensureFreshMetadata();
-
+                // 发送JoinGroupRequest请求加入group
                 ensureActiveGroup();
                 now = time.milliseconds();
             }
 
+            //保持留在group中
             pollHeartbeat(now);
         } else {
             if (metadata.updateRequested() && !client.hasReadyNodes()) {
@@ -268,6 +274,97 @@ title: Kafka Consumer(一)
     }
 ```
 
+```java
+    // AbstractCoordinator.java
+    public void ensureActiveGroup() {
+        ensureCoordinatorReady();
+        // 如果coordinator已经ready,则开启心跳检测线程
+        startHeartbeatThreadIfNeeded();
+        // 
+        joinGroupIfNeeded();
+    }
+
+    void joinGroupIfNeeded() {
+        //如果需要join,则轮询join,直到join成功
+        while (needRejoin() || rejoinIncomplete()) {
+            ensureCoordinatorReady();
+
+            // 
+            if (needsJoinPrepare) {
+                //在rebalance过程结束前置调用一次，将上一次的一些缓存进行清空
+                onJoinPrepare(generation.generationId, generation.memberId);
+                needsJoinPrepare = false;
+            }
+
+            // 发送JoinGroupRequest请求并持有返回的结果
+            // initiateJoinGroup方法中为了不让心跳线程妨碍join过程首先暂停心跳线程,重新开始是在joinFuture的成功回调中重新开启
+            // 设置内部state = MemberState.REBALANCING
+            // 发送并返回future用于阻塞等待
+            RequestFuture<ByteBuffer> future = initiateJoinGroup();
+            // 阻塞等待future结果
+            client.poll(future);
+
+            if (future.succeeded()) {
+                onJoinComplete(generation.generationId, generation.memberId, generation.protocol, future.value());
+
+                // join成功则重置本地变量
+                resetJoinGroupFuture();
+                needsJoinPrepare = true;
+            } else {
+                // failure handle code ...
+            }
+        }
+    }
+
+    private synchronized RequestFuture<ByteBuffer> initiateJoinGroup() {
+        if (joinFuture == null) {
+            // 暂停心跳线程
+            disableHeartbeatThread();
+            state = MemberState.REBALANCING;
+
+            // 构建JoinGroupRequest进行（re）join一个group
+            joinFuture = sendJoinGroupRequest();
+            joinFuture.addListener(new RequestFutureListener<ByteBuffer>() {
+                // result handle callback ...
+            });
+        }
+        return joinFuture;
+    }
+
+    // joinGroup的结果处理回调
+    private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGroupResponse, ByteBuffer> {
+        @Override
+        public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> future) {
+            Errors error = joinResponse.error();
+            if (error == Errors.NONE) {
+                // other code ...
+
+                synchronized (AbstractCoordinator.this) {
+                    // other code ...
+                     else {
+                        AbstractCoordinator.this.generation = new Generation(joinResponse.generationId(),
+                                joinResponse.memberId(), joinResponse.groupProtocol());
+                        if (joinResponse.isLeader()) {
+                            //作为leaderjoin, 用本地的给member进行分配对应的topic-partition构造SyncGroupRequest发送回Broker
+                            onJoinLeader(joinResponse).chain(future);
+                        } else {
+                            // 作为follower 发送空的SyncGroupRequest给Broker
+                            onJoinFollower().chain(future);
+                        }
+                    }
+                }
+            } else {
+                //异常处理
+            }
+        }
+    }
+```
+
+
+
+## <a id="KafkaApis">KafkaApis</a>
+
+　　现在来看服务端对客户端发送来的FindCoordinatorRequest及JoinGroupRequest请求的处理过程。
 
 
 ## TBD
