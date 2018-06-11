@@ -360,7 +360,9 @@ title: Kafka Consumer(一)
     }
 ```
 
+　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，如果作为follower加入，则发送回一个空的分配结果给服务端。
 
+　　作为leader进行分配的实现有很多种方式，都是直接或间接继承PartitionAssignor，重写assign()等方法，具体实现由如round,random，sticky等。
 
 ## <a id="KafkaApis">KafkaApis</a>
 
