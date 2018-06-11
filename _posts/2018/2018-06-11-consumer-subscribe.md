@@ -360,13 +360,27 @@ title: Kafka Consumer(一)
     }
 ```
 
-　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，如果作为follower加入，则发送回一个空的分配结果给服务端。
+　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，构造SyncGroupRequest放给服务端。如果作为follower加入，则发送回一个空的分配结果给服务端。
 
 　　作为leader进行分配的实现有很多种方式，都是直接或间接继承PartitionAssignor，重写assign()等方法，具体实现由如round,random，sticky等。
 
 ## <a id="KafkaApis">KafkaApis</a>
 
-　　现在来看服务端对客户端发送来的FindCoordinatorRequest及JoinGroupRequest请求的处理过程。
+　　现在来看服务端对客户端发送来的FindCoordinatorRequest、JoinGroupRequest及SyncGroupRequest请求的处理过程。
+
+**FindCoordinatorRequest**
+
+　　KafkaApis对FindCoordinatorRequest的处理过程与在[Kafka事务消息过程分析(一)](https://daleizhou.github.io/posts/startup-of-Kafka.html)中处理过程相似，区别是创建的内部topic不同。如果FindCoordinatorRequest.CoordinatorType为GROUP，则对应的内部topic为*__consumer_offsets*，这里不再赘述，感兴趣可以翻看该篇博文。
+
+**JoinGroupRequest**
+
+**SyncGroupRequest**
 
 
-## TBD
+## <a id="conclusion">总结</a>
+
+　　本篇介绍了。
+
+## <a id="references">References</a>
+
+* http://matt33.com/2017/10/22/consumer-join-group/
