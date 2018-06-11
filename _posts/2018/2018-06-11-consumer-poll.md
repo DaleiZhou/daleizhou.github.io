@@ -11,6 +11,8 @@ title: KafkaConsumer(一)
 
 　　从这篇开始从KafkaConsumer为切入点，大概用四篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题的相关实现。
 
+## <a id="subscribe">subscribe</a>
+
 　　Kafka的subscribe()方法有两种订阅方法，一种是直接通过Topic进行调用，另一种是通过传入Pattern的方式进行主题的订阅。下面分别来介绍这两种。
 
 ```java
@@ -116,6 +118,42 @@ title: KafkaConsumer(一)
 ```
 
 　　其实通过Topic和Pattern进行主题的订阅是相似的，形式上的区别是一个直接指明主题列表，一个是通过Pattern的方式指定，另一个重要区别是通过Pattern方式的订阅，会在订阅动作完成后，如果有新的符合Pattern的主题的加入，则会更新订阅列表将其加入进来。
+
+## <a id="subscribe">subscribe</a>
+
+　　kafka提供了另一种订阅模式:assign模式。这是一种由用户手工分配TopicPartition列表的非增量订阅模式。从实现上，assign模式不会使用Consumer Group的管理功能，因此如果consumer group的成员、cluster和topic metadata更新都不会触发rebalance操作，需要用户自行处理。
+
+```java
+    //KafkaConsumer.java
+    public void assign(Collection<TopicPartition> partitions) {
+        acquireAndEnsureOpen();
+        try {
+            if (partitions == null) {
+                throw new IllegalArgumentException("Topic partition collection to assign to cannot be null");
+            } else if (partitions.isEmpty()) {
+                // 同样地，如果传入的partitions为empty，效果和unsubscribe()相同
+                this.unsubscribe();
+            } else {
+                // 从手工指定的topicpartition列表中获取可用的topic列表用于订阅
+                Set<String> topics = new HashSet<>();
+                for (TopicPartition tp : partitions) {
+                    String topic = (tp != null) ? tp.topic() : null;
+                    if (topic == null || topic.trim().isEmpty())
+                        throw new IllegalArgumentException("Topic partitions to assign to cannot have null or empty topic");
+                    topics.add(topic);
+                }
+
+                // 在设置新的assign时，如果客户端开启了auto-commit，则旧的assign的异步commit需要全部提交
+                this.coordinator.maybeAutoCommitOffsetsAsync(time.milliseconds());
+
+                this.subscriptions.assignFromUser(new HashSet<>(partitions));
+                metadata.setTopics(topics);
+            }
+        } finally {
+            release();
+        }
+    }
+```
 
 
 ## TBD
