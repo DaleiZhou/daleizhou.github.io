@@ -274,13 +274,15 @@ title: Kafka Consumer(一)
     }
 ```
 
+　　poll()中，如果是subscribe方式订阅并且meta有更新，则调用AbstractCoordinator.ensureActiveGroup()进行加入group，该方法会阻塞等待joinGroupIfNeeded()返回。下面为具体代码。
+
 ```java
     // AbstractCoordinator.java
     public void ensureActiveGroup() {
         ensureCoordinatorReady();
         // 如果coordinator已经ready,则开启心跳检测线程
         startHeartbeatThreadIfNeeded();
-        // 
+        // 如果需要join,则轮询join,直到join成功
         joinGroupIfNeeded();
     }
 
@@ -373,6 +375,184 @@ title: Kafka Consumer(一)
 　　KafkaApis对FindCoordinatorRequest的处理过程与在[Kafka事务消息过程分析(一)](https://daleizhou.github.io/posts/startup-of-Kafka.html)中处理过程相似，区别是创建的内部topic不同。如果FindCoordinatorRequest.CoordinatorType为GROUP，则对应的内部topic为*__consumer_offsets*，这里不再赘述，感兴趣可以翻看该篇博文。
 
 **JoinGroupRequest**
+
+　　下面介绍kafkaApis收到JoinGroupRequest的请求处理过程，入口任然从handle()方法开始。该方法进行校验等处理后调用groupCoordinator.handleJoinGroup()转由groupCoordinator处理，将memberId加入group。
+
+```scala
+  //KafkaApis.scala 
+  def handle(request: RequestChannel.Request) {
+        case ApiKeys.JOIN_GROUP => handleJoinGroupRequest(request)
+  }
+
+  def handleJoinGroupRequest(request: RequestChannel.Request) {
+    val joinGroupRequest = request.body[JoinGroupRequest]
+
+    // the callback for sending a join-group response
+    def sendResponseCallback(joinResult: JoinGroupResult) {
+      //该member返回给consumer,用于leader分配tp
+      val members = joinResult.members map { case (memberId, metadataArray) => (memberId, ByteBuffer.wrap(metadataArray)) }
+      def createResponse(requestThrottleMs: Int): AbstractResponse = {
+        // other code...
+      }
+      // 限速发送回结果
+      sendResponseMaybeThrottle(request, createResponse)
+    }
+
+    if (!authorize(request.session, Read, new Resource(Group, joinGroupRequest.groupId()))) {
+      // 身份校验异常处理
+    } else {
+      // let the coordinator to handle join-group
+      val protocols = joinGroupRequest.groupProtocols().asScala.map(protocol =>
+        (protocol.name, Utils.toArray(protocol.metadata))).toList
+      //将请求参数传入handleJoinGroup()转由groupCoordinator处理
+      groupCoordinator.handleJoinGroup(
+        joinGroupRequest.groupId,
+        joinGroupRequest.memberId,
+        request.header.clientId,
+        request.session.clientAddress.toString,
+        joinGroupRequest.rebalanceTimeout,
+        joinGroupRequest.sessionTimeout,
+        joinGroupRequest.protocolType,
+        protocols,
+        sendResponseCallback)
+    }
+  }
+```
+
+　　GroupCoordinator.handleJoinGroup()
+
+```scala
+  // groupCoordinator.scala
+  def handleJoinGroup(groupId: String,
+                      memberId: String,
+                      clientId: String,
+                      clientHost: String,
+                      rebalanceTimeoutMs: Int,
+                      sessionTimeoutMs: Int,
+                      protocolType: String,
+                      protocols: List[(String, Array[Byte])],
+                      responseCallback: JoinCallback): Unit = {
+    // 该事件不可以groupId调用返回错误给客户端
+    validateGroupStatus(groupId, ApiKeys.JOIN_GROUP).foreach { error =>
+      responseCallback(joinError(memberId, error))
+      return
+    }
+
+    //timeout...
+    else {
+      // 如不存在groupId，则创建group,
+      // 通过doJoinGroup()将memberId加入已有或刚创建的group
+      groupManager.getGroup(groupId) match {
+        case None =>
+          if (memberId != JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+            responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+          } else {
+            val group = groupManager.addGroup(new GroupMetadata(groupId, initialState = Empty))
+            doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
+          }
+
+        case Some(group) =>
+          doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
+      }
+    }
+  }
+
+  private def doJoinGroup(group: GroupMetadata,
+                          memberId: String,
+                          clientId: String,
+                          clientHost: String,
+                          rebalanceTimeoutMs: Int,
+                          sessionTimeoutMs: Int,
+                          protocolType: String,
+                          protocols: List[(String, Array[Byte])],
+                          responseCallback: JoinCallback) {
+    group.inLock {
+      if (!group.is(Empty) && (!group.protocolType.contains(protocolType) || !group.supportsProtocols(protocols.map(_._1).toSet))) {
+        // if the new member does not support the group protocol, reject it
+        responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
+      } else if (group.is(Empty) && (protocols.isEmpty || protocolType.isEmpty)) {
+        //reject if first member with empty group protocol or protocolType is empty
+        responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
+      } else if (memberId != JoinGroupRequest.UNKNOWN_MEMBER_ID && !group.has(memberId)) {
+        // if the member trying to register with a un-recognized id, send the response to let
+        // it reset its member id and retry
+        responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+      } else {
+        group.currentState match {
+          case Dead =>
+            // if the group is marked as dead, it means some other thread has just removed the group
+            // from the coordinator metadata; this is likely that the group has migrated to some other
+            // coordinator OR the group is in a transient unstable phase. Let the member retry
+            // joining without the specified member id,
+            responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+          case PreparingRebalance =>
+            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+                protocols, group, responseCallback)
+            } else {
+              val member = group.get(memberId)
+              updateMemberAndRebalance(group, member, protocols, responseCallback)
+            }
+
+          case CompletingRebalance =>
+            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+                protocols, group, responseCallback)
+            } else {
+              val member = group.get(memberId)
+              if (member.matches(protocols)) {
+                // member is joining with the same metadata (which could be because it failed to
+                // receive the initial JoinGroup response), so just return current group information
+                // for the current generation.
+                responseCallback(JoinGroupResult(
+                  members = if (group.isLeader(memberId)) {
+                    group.currentMemberMetadata
+                  } else {
+                    Map.empty
+                  },
+                  memberId = memberId,
+                  generationId = group.generationId,
+                  subProtocol = group.protocolOrNull,
+                  leaderId = group.leaderOrNull,
+                  error = Errors.NONE))
+              } else {
+                // member has changed metadata, so force a rebalance
+                updateMemberAndRebalance(group, member, protocols, responseCallback)
+              }
+            }
+
+          case Empty | Stable =>
+            if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+              // if the member id is unknown, register the member to the group
+              addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+                protocols, group, responseCallback)
+            } else {
+              val member = group.get(memberId)
+              if (group.isLeader(memberId) || !member.matches(protocols)) {
+                // force a rebalance if a member has changed metadata or if the leader sends JoinGroup.
+                // The latter allows the leader to trigger rebalances for changes affecting assignment
+                // which do not affect the member metadata (such as topic metadata changes for the consumer)
+                updateMemberAndRebalance(group, member, protocols, responseCallback)
+              } else {
+                // for followers with no actual change to their metadata, just return group information
+                // for the current generation which will allow them to issue SyncGroup
+                responseCallback(JoinGroupResult(
+                  members = Map.empty,
+                  memberId = memberId,
+                  generationId = group.generationId,
+                  subProtocol = group.protocolOrNull,
+                  leaderId = group.leaderOrNull,
+                  error = Errors.NONE))
+              }
+            }
+        }
+
+        if (group.is(PreparingRebalance))
+          joinPurgatory.checkAndComplete(GroupKey(group.groupId))
+      }
+    }
+  }
+```
 
 **SyncGroupRequest**
 

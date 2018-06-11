@@ -107,7 +107,7 @@ title: Kafka事务消息过程分析(三)
         case ApiKeys.END_TXN => handleEndTxnRequest(request)
   }
 
-  handleEndTxnRequest(request: RequestChannel.Request): Unit = {
+  def handleEndTxnRequest(request: RequestChannel.Request): Unit = {
     ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
     val endTxnRequest = request.body[EndTxnRequest]
     val transactionalId = endTxnRequest.transactionalId
