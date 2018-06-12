@@ -174,36 +174,12 @@ title: Kafka Consumer(二)
       })
     }
 
+    // 根据magic兼容结果
     def convertedPartitionData(tp: TopicPartition, data: FetchResponse.PartitionData) = {
-      // Down-conversion of the fetched records is needed when the stored magic version is
-      // greater than that supported by the client (as indicated by the fetch request version). If the
-      // configured magic version for the topic is less than or equal to that supported by the version of the
-      // fetch request, we skip the iteration through the records in order to check the magic version since we
-      // know it must be supported. However, if the magic version is changed from a higher version back to a
-      // lower version, this check will no longer be valid and we will fail to down-convert the messages
-      // which were written in the new format prior to the version downgrade.
-      replicaManager.getMagic(tp).flatMap { magic =>
-        val downConvertMagic = {
-          if (magic > RecordBatch.MAGIC_VALUE_V0 && versionId <= 1 && !data.records.hasCompatibleMagic(RecordBatch.MAGIC_VALUE_V0))
-            Some(RecordBatch.MAGIC_VALUE_V0)
-          else if (magic > RecordBatch.MAGIC_VALUE_V1 && versionId <= 3 && !data.records.hasCompatibleMagic(RecordBatch.MAGIC_VALUE_V1))
-            Some(RecordBatch.MAGIC_VALUE_V1)
-          else
-            None
-        }
-
-        downConvertMagic.map { magic =>
-          trace(s"Down converting records from partition $tp to message format version $magic for fetch request from $clientId")
-          val converted = data.records.downConvert(magic, fetchContext.getFetchOffset(tp).get, time)
-          updateRecordsProcessingStats(request, tp, converted.recordsProcessingStats)
-          new FetchResponse.PartitionData(data.error, data.highWatermark, FetchResponse.INVALID_LAST_STABLE_OFFSET,
-            data.logStartOffset, data.abortedTransactions, converted.records)
-        }
-
-      }.getOrElse(data)
+        // Down-conversion 结果兼容
     }
 
-    // the callback for process a fetch response, invoked before throttling
+    // 用于处理成功后回调给客户返回结果
     def processResponseCallback(responsePartitionData: Seq[(TopicPartition, FetchPartitionData)]) {
       val partitions = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData]
       responsePartitionData.foreach{ case (tp, data) =>
@@ -265,7 +241,7 @@ title: Kafka Consumer(二)
     if (interesting.isEmpty)
       processResponseCallback(Seq.empty)
     else {
-      // call the replica manager to fetch messages from the local replica
+      // 调用replicaManager从本地副本中获取消息(kafka读写和leader交互，因此本地副本认为是leader副本)
       replicaManager.fetchMessages(
         fetchRequest.maxWait.toLong,
         fetchRequest.replicaId,
@@ -279,6 +255,8 @@ title: Kafka Consumer(二)
     }
   }
 ```
+
+　　handleFetchRequest()的处理过程主要的过程是调用ReplicaManager.fetchMessages()方法，从本地副本中获取数据，并等待足够多的数据进行返回，其中传入的responseCallback方法在超时或者是满足fetch条件时将会被调用，将结果返回给客户端。
 
 ```scala
   //ReplicaManager.scala
@@ -295,6 +273,7 @@ title: Kafka Consumer(二)
     val fetchOnlyFromLeader = replicaId != Request.DebuggingConsumerId && replicaId != Request.FutureLocalReplicaId
     val fetchOnlyCommitted = !isFromFollower && replicaId != Request.FutureLocalReplicaId
 
+    // 从调用readFromLocalLog()方法从log实际读取数据，并返回结果
     def readFromLog(): Seq[(TopicPartition, LogReadResult)] = {
       val result = readFromLocalLog(
         replicaId = replicaId,
@@ -311,41 +290,26 @@ title: Kafka Consumer(二)
 
     val logReadResults = readFromLog()
 
-    // check if this fetch request can be satisfied right away
-    val logReadResultValues = logReadResults.map { case (_, v) => v }
-    val bytesReadable = logReadResultValues.map(_.info.records.sizeInBytes).sum
-    val errorReadingData = logReadResultValues.foldLeft(false) ((errorIncurred, readResult) =>
-      errorIncurred || (readResult.error != Errors.NONE))
-
-    // respond immediately if 1) fetch request does not want to wait
-    //                        2) fetch request does not require any data
-    //                        3) has enough data to respond
-    //                        4) some error happens while reading data
+    // other code ...
+    
+    // 检查是否满足立即返回的条件，当如下任一条件满足时：
+    // 1. timeout 2.  fetchInfos列表为空 3. 读取到最小要求的字节数 4 读取结果中有error
+    // 满足上述任一情况时立即返回给客户端
     if (timeout <= 0 || fetchInfos.isEmpty || bytesReadable >= fetchMinBytes || errorReadingData) {
-      val fetchPartitionData = logReadResults.map { case (tp, result) =>
-        tp -> FetchPartitionData(result.error, result.highWatermark, result.leaderLogStartOffset, result.info.records,
-          result.lastStableOffset, result.info.abortedTransactions)
-      }
-      responseCallback(fetchPartitionData)
+      // 拼装结果立即触发回调方法返回结果
     } else {
-      // construct the fetch results from the read results
-      val fetchPartitionStatus = logReadResults.map { case (topicPartition, result) =>
-        val fetchInfo = fetchInfos.collectFirst {
-          case (tp, v) if tp == topicPartition => v
-        }.getOrElse(sys.error(s"Partition $topicPartition not found in fetchInfos"))
-        (topicPartition, FetchPartitionStatus(result.info.fetchOffsetMetadata, fetchInfo))
-      }
-      val fetchMetadata = FetchMetadata(fetchMinBytes, fetchMaxBytes, hardMaxBytesLimit, fetchOnlyFromLeader,
-        fetchOnlyCommitted, isFromFollower, replicaId, fetchPartitionStatus)
+        // 根据读取的结果，构建fetchMetadata用于构建一个DelayedFetch的延迟操作
+        // 当下列任一条件满足时：
+        // 1. 当前broker不再是要读取的tp的leader
+        // 2. 当前broker失去了对某个tp的感知
+        // 3. fetch的offset不在最后一个segment上
+        // 4. 累计的读取字节数超过最小要求字节数
+        // 5. tp是在一个离线的日志目录下
+        // 当任一满足时，完成延迟操作，延迟操作结束方法中通过replicaManager.readFromLocalLog()读取log,并直接出发callback返回给客户
+
+      // code ...
       val delayedFetch = new DelayedFetch(timeout, fetchMetadata, this, quota, isolationLevel, responseCallback)
-
-      // create a list of (topic, partition) pairs to use as keys for this delayed fetch operation
-      val delayedFetchKeys = fetchPartitionStatus.map { case (tp, _) => new TopicPartitionOperationKey(tp) }
-
-      // try to complete the request immediately, otherwise put it into the purgatory;
-      // this is because while the delayed fetch operation is being created, new requests
-      // may arrive and hence make this operation completable.
-      delayedFetchPurgatory.tryCompleteElseWatch(delayedFetch, delayedFetchKeys)
+      // code ...
     }
   }
 
