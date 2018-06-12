@@ -9,7 +9,7 @@ title: Kafka Consumer(一)
 
   代码版本: 2.0.0-SNAPSHOT, 涉及内容有subscribe, assign, join group
 
-　　从这篇开始从KafkaConsumer为切入点，大概用三篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题，加入Group的具体实现。
+　　从这篇开始从KafkaConsumer为切入点，大概用两篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题，加入Group的具体实现。
 
 ## <a id="subscribe">subscribe</a>
 
