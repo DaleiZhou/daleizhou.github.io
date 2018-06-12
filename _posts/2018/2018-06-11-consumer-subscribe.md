@@ -363,11 +363,15 @@ title: Kafka Consumer(一)
     }
 ```
 
-　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，构造SyncGroupRequest放给服务端。如果作为follower加入，则发送回一个空的分配结果给服务端。
+　　从代码上看ConsumerCoordinator.poll()发起的join过程，最终构造JoinGroupRequest向GroupCoordinator进行(re)join请求。结果返回后的回调方法中会向Coordinator发回assign策略，细节是如果作为leader加入，需要将返回的menber和topic-partition通过某种策略进行分配，构造SyncGroupRequest放给服务端。如果作为follower加入，则发送回一个空的分配结果给服务端，用于获取本memberId对应的分配信息。
 
 　　作为leader进行分配的实现有很多种方式，都是直接或间接继承PartitionAssignor，重写assign()等方法，具体实现由如round,random，sticky等。
 
-　　Join成功后调用ConsumerCoordinator.onJoinComplete()方法，完成更新TopicPartition的订阅，metadata的更新，及执行用户定义的负载均衡后的回调方法。至此Consumer端完成join group的调用。
+　　Join成功后调用ConsumerCoordinator.onJoinComplete()方法，完成更新TopicPartition的订阅，metadata的更新，及执行用户定义的负载均衡后的回调方法。
+
+　　现在的问题是如果一个状态为Stable的Group,新加入一个member，其它member如何感知到进行rebalance呢。答案就是心跳不仅用于告诉服务端自己活着，每次带着自己的年代记号，用于检测是否已经发生了rebalance。
+
+　　至此Consumer端完成join group的调用。
 
 ## <a id="KafkaApis">KafkaApis</a>
 
