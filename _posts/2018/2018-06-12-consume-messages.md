@@ -194,28 +194,18 @@ title: Kafka Consumer(二)
       // fetch response callback invoked after any throttling
       def fetchResponseCallback(bandwidthThrottleTimeMs: Int) {
         def createResponse(requestThrottleTimeMs: Int): FetchResponse = {
-          val convertedData = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData]
-          unconvertedFetchResponse.responseData().asScala.foreach { case (tp, partitionData) =>
-            if (partitionData.error != Errors.NONE)
-              debug(s"Fetch request with correlation id ${request.header.correlationId} from client $clientId " +
-                s"on partition $tp failed due to ${partitionData.error.exceptionName}")
-            convertedData.put(tp, convertedPartitionData(tp, partitionData))
-          }
+          // 兼容结果code...
+
+          // 构造返回结果
           val response = new FetchResponse(unconvertedFetchResponse.error(), convertedData,
             bandwidthThrottleTimeMs + requestThrottleTimeMs, unconvertedFetchResponse.sessionId())
-          response.responseData.asScala.foreach { case (topicPartition, data) =>
-            // record the bytes out metrics only when the response is being sent
-            brokerTopicStats.updateBytesOut(topicPartition.topic, fetchRequest.isFromFollower, data.records.sizeInBytes)
+          // other code ...
           }
           response
         }
 
-        trace(s"Sending Fetch response with partitions.size=${unconvertedFetchResponse.responseData().size()}, " +
-          s"metadata=${unconvertedFetchResponse.sessionId()}")
-
-        if (fetchRequest.isFromFollower)
-          sendResponseExemptThrottle(request, createResponse(0))
         else
+          // 限速返回结果给客户端
           sendResponseMaybeThrottle(request, requestThrottleMs => createResponse(requestThrottleMs))
       }
 
@@ -229,9 +219,7 @@ title: Kafka Consumer(二)
         quotas.leader.record(responseSize)
         fetchResponseCallback(bandwidthThrottleTimeMs = 0)
       } else {
-        // Fetch size used to determine throttle time is calculated before any down conversions.
-        // This may be slightly different from the actual response size. But since down conversions
-        // result in data being loaded into memory, it is better to do this after throttling to avoid OOM.
+        // 用兼容前的数据的大小来做限流，虽然大小上有出入，但是unconvertedFetchResponse已经被载入到内存里，直接使用，减少OOM出现几率
         val responseStruct = unconvertedFetchResponse.toStruct(versionId)
         quotas.fetch.maybeRecordAndThrottle(request.session, clientId, responseStruct.sizeOf,
           fetchResponseCallback)
@@ -362,16 +350,17 @@ title: Kafka Consumer(二)
         val fetchTimeMs = time.milliseconds
         val logReadInfo = localReplica.log match {
           case Some(log) =>
+            // fetchInfo.maxBytes与本地最多读取字节数取一个最小值作为本次读取的最大字节数
             val adjustedFetchSize = math.min(partitionFetchSize, limitBytes)
-
-            // Try the read first, this tells us whether we need all of adjustedFetchSize for this partition
+            // 通过log.read()方法读取数据
             val fetch = log.read(offset, adjustedFetchSize, maxOffsetOpt, minOneMessage, isolationLevel)
 
-            // If the partition is being throttled, simply return an empty set.
+            // 该partition发送太快，需要限流，填充空结果
             if (shouldLeaderThrottle(quota, tp, replicaId))
               FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
-            // For FetchRequest version 3, we replace incomplete message sets with an empty one as consumers can make
-            // progress in such cases and don't need to report a `RecordTooLargeException`
+            // 如果是versionId >=3 , hardMaxBytesLimit为false
+            // 如果是hardMaxBytesLimit为false && fetch.firstEntryIncomplete
+            // 则返回空的结果，不需要发送RecordTooLargeException
             else if (!hardMaxBytesLimit && fetch.firstEntryIncomplete)
               FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
             else fetch
@@ -413,8 +402,8 @@ title: Kafka Consumer(二)
   }
 ```
 
+　　ReplicaManager.readFromLocalLog()方法中主要地调用了log.read()方法从日志中读取消息。该方法从不大于startOffset的那个segment开始读取数据，如果未读满并且还有未读取的segment,依次向前遍历读取，最后拼接结果给客户端返回。
+
 ## <a id="conclusion">总结</a>
 
-## <a id="references">References</a>
-
-#### TBD
+　　本文主要介绍了KafkaConsumer.pollOnce()中拉取消息的实现细节。客户端为每个被分配的topic-partition对应的node构建一个FetchRequest请求，而对应地Broker端收到这个消息做一些检查之后从本地副本中读取消息。如果消息为达到最小字节数且未超时，则产生延迟fetch操作继续读取，直到满足条件结束。Broker将读取的消息封装好返回给客户端，至此完成了拉取消息的整个过程。
