@@ -313,9 +313,7 @@ title: Kafka Consumer(二)
     }
   }
 
-  /**
-   * Read from multiple topic partitions at the given offset up to maxSize bytes
-   */
+  // 从log中读取消息
   def readFromLocalLog(replicaId: Int,
                        fetchOnlyFromLeader: Boolean,
                        readOnlyCommitted: Boolean,
@@ -324,7 +322,7 @@ title: Kafka Consumer(二)
                        readPartitionInfo: Seq[(TopicPartition, PartitionData)],
                        quota: ReplicaQuota,
                        isolationLevel: IsolationLevel): Seq[(TopicPartition, LogReadResult)] = {
-
+    // 每个tp的实际读取方法
     def read(tp: TopicPartition, fetchInfo: PartitionData, limitBytes: Int, minOneMessage: Boolean): LogReadResult = {
       val offset = fetchInfo.fetchOffset
       val partitionFetchSize = fetchInfo.maxBytes
@@ -334,9 +332,6 @@ title: Kafka Consumer(二)
       brokerTopicStats.allTopicsStats.totalFetchRequestRate.mark()
 
       try {
-        trace(s"Fetching log segment for partition $tp, offset $offset, partition fetch size $partitionFetchSize, " +
-          s"remaining response limit $limitBytes" +
-          (if (minOneMessage) s", ignoring response/partition size limits" else ""))
 
         // decide whether to only fetch from leader
         val localReplica = if (fetchOnlyFromLeader)
@@ -350,7 +345,7 @@ title: Kafka Consumer(二)
         else
           None
 
-        // decide whether to only fetch committed data (i.e. messages below high watermark)
+        // 根据隔离级别决定是否只读取已经commit的消息, 决定读取的最大偏移量
         val maxOffsetOpt = if (readOnlyCommitted)
           Some(lastStableOffset.getOrElse(initialHighWatermark))
         else
@@ -396,41 +391,15 @@ title: Kafka Consumer(二)
                       lastStableOffset = lastStableOffset,
                       exception = None)
       } catch {
-        // NOTE: Failed fetch requests metric is not incremented for known exceptions since it
-        // is supposed to indicate un-expected failure of a broker in handling a fetch request
-        case e@ (_: UnknownTopicOrPartitionException |
-                 _: NotLeaderForPartitionException |
-                 _: ReplicaNotAvailableException |
-                 _: KafkaStorageException |
-                 _: OffsetOutOfRangeException) =>
-          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
-                        highWatermark = -1L,
-                        leaderLogStartOffset = -1L,
-                        leaderLogEndOffset = -1L,
-                        followerLogStartOffset = -1L,
-                        fetchTimeMs = -1L,
-                        readSize = partitionFetchSize,
-                        lastStableOffset = None,
-                        exception = Some(e))
-        case e: Throwable =>
-          brokerTopicStats.topicStats(tp.topic).failedFetchRequestRate.mark()
-          brokerTopicStats.allTopicsStats.failedFetchRequestRate.mark()
-          error(s"Error processing fetch operation on partition $tp, offset $offset", e)
-          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
-                        highWatermark = -1L,
-                        leaderLogStartOffset = -1L,
-                        leaderLogEndOffset = -1L,
-                        followerLogStartOffset = -1L,
-                        fetchTimeMs = -1L,
-                        readSize = partitionFetchSize,
-                        lastStableOffset = None,
-                        exception = Some(e))
+        // exception handle code ...
       }
     }
 
     var limitBytes = fetchMaxBytes
     val result = new mutable.ArrayBuffer[(TopicPartition, LogReadResult)]
+    // 如果minOneMessage为true,则在segment中读取消息时第一个消息(如果有)将会被读取出来，即便是超过了maxSize
     var minOneMessage = !hardMaxBytesLimit
+    // 根据传入的readPartitionInfo遍历读取tp对应的log
     readPartitionInfo.foreach { case (tp, fetchInfo) =>
       val readResult = read(tp, fetchInfo, limitBytes, minOneMessage)
       val recordBatchSize = readResult.info.records.sizeInBytes
