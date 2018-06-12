@@ -712,9 +712,9 @@ title: Kafka Consumer(一)
 
 ## <a id="conclusion">总结</a>
 
-　　本篇从KafkaConsumer消费消息为切入点，介绍了两种订阅模式：subscribe和assign模式。而subscribe模式会在poll消息时决定是否触发加入group操作，进行rebalance动作。在Join的过程中总共会产生FindCoordinatorRequest，JoinGroupRequest以及SyncGroupRequest的请求。本文的后半节介绍了这几个请求客户端与服务端处理的具体过程。
+　　本篇从KafkaConsumer消费消息为切入点，介绍了两种订阅模式：subscribe和assign模式。而subscribe模式会在poll消息时决定是否触发加入group操作，进行rebalance动作。在Join的过程中总共会产生FindCoordinatorRequest，JoinGroupRequest以及SyncGroupRequest的请求。服务端每次发生rebalance会向客户端返回年代记号，客户端如果通过心跳检测活着别的调用发现年代值不一致，就需要重新加入group。本文的后半节介绍了这几个请求客户端与服务端处理的具体过程。
 
-　　下一篇继续从KafkaConsumer.poll()切入，分析学习消息的具体消费过程。
+　　下一篇继续从KafkaConsumer.pollOnce()切入，分析学习消息的具体消费过程。
 
 ## <a id="references">References</a>
 
