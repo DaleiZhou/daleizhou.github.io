@@ -1,7 +1,7 @@
 ---
 layout: post
 category: Kafka
-title: Kafka Consumer(二)
+title: Log Management
 ---
 
 ## 内容 
