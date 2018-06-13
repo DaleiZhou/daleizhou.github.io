@@ -339,12 +339,6 @@ title: Kafka Consumer(二)
         else
           None
 
-        /* Read the LogOffsetMetadata prior to performing the read from the log.
-         * We use the LogOffsetMetadata to determine if a particular replica is in-sync or not.
-         * Using the log end offset after performing the read can lead to a race condition
-         * where data gets appended to the log immediately after the replica has consumed from it
-         * This can cause a replica to always be out of sync.
-         */
         val initialLogEndOffset = localReplica.logEndOffset.messageOffset
         val initialLogStartOffset = localReplica.logStartOffset
         val fetchTimeMs = time.milliseconds
@@ -408,5 +402,4 @@ title: Kafka Consumer(二)
 
 　　本文主要介绍了KafkaConsumer.pollOnce()中拉取消息的实现细节。客户端为每个被分配的topic-partition对应的node构建一个FetchRequest请求，而对应地Broker端收到这个消息做一些检查之后从本地副本中读取消息。如果消息为达到最小字节数且未超时，则产生延迟fetch操作继续读取，直到满足条件结束。Broker将读取的消息封装好返回给客户端，至此完成了拉取消息的整个过程。
 
-
-    底层日志的部分这里说的不是很明白，待笔者揣摩出日志的设计细节再进行修改补充。
+　　Producer及Consumer的操作最后都会落实到Broker端的日志上，这个部分之前一直没有介绍到这么底层，下一篇开始学习日志的部分，也是对于已经介绍的这两部分做补充。
