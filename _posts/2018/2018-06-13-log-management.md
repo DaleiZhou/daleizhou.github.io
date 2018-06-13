@@ -19,6 +19,7 @@ title: Log Management
 
 ## <a id="Kafka Log">Kafka Log</a>
 　　下面我们来看一下TopicPartition的示意图。
+
 <img src="/assets/img/2018/06/13/Anatomy_of_a_topic.png" />
 
 
