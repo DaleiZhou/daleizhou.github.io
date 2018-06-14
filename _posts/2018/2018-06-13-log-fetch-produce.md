@@ -1,7 +1,7 @@
 ---
 layout: post
 category: Kafka
-title: Log Management
+title: Kafka log的读写分析
 ---
 
 ## 内容 
@@ -31,7 +31,7 @@ title: Log Management
 ```sh
 ll
 
-
+TODO
 ```
 
 　　每个Segment都对应着base_offset.index,base_offset.log文件。这个base_offset代表这个Segment消息在整个消息中的基准偏移量，他会小于等于这个Segment中所有的消息的偏移，也严格大于前一个Segment中所有消息的偏移量。
@@ -42,7 +42,7 @@ ll
 <img src="/assets/img/2018/06/13/SegmentIndexAndLog.png" />
 </div>
 
-　　从图上看每个日志的segment对应一个index文件。index文件是稀疏的，即并不是每一个Record都会对应index文件里的一条，这样的设计可以有效的减小index文件的大小，使得可以载入内存，在内存中进行比较运算，虽然可能不能直接根据index直接找到某一个record,但是可以先通过二分的形式找到不大于要检索的offset的那个index记录，然后再往后顺序遍历即可。
+　　从图上看每个日志的segment对应一个index文件。index文件是稀疏的，即并不是每一个Record都会对应index文件里的一条，这样的设计可以有效的减小index文件的大小，使得可以载入内存，在内存中进行比较运算，虽然可能不能直接根据index直接找到某一个record,但是可以先通过二分的形式找到不大于要检索的offset的那个index记录，然后再往后顺序遍历即可找到。
 
 　　Index的格式为8个字节组成一条记录，其中前4个字节标识消息在该Segment中的相对offset,后4个字节标识该消息在该Segment中的相对位置。
 
@@ -56,6 +56,10 @@ ll
 
 　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的*zigzag*编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
 
+
+由上述的介绍我们对Kafka的log有了一个直观的印象，现在结合Kafka处理的fetch和produce请求最后日志的读写具体的代码细节来进行源码分析。
+
+## <a id="Fetch">Fetch</a>
 
 
 
