@@ -40,6 +40,9 @@ ll
 <img src="/assets/img/2018/06/13/RecordStruct.png" />
 </div>
 
+　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的zigzag编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
+
+
 
 ## TODO
 
