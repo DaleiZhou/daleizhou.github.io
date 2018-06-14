@@ -140,10 +140,8 @@ TODO
             s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
         }
 
-        // now that we have valid records, offsets assigned, and timestamps updated, we need to
-        // validate the idempotent/transactional state of the producers and collect some metadata
         // analyzeAndValidateProducerState方法中过滤一遍validRecords，
-        // 将重复的，可更新状态的，可完成的txn分别取出来
+        // 将重复的，可更新状态的、可完成的txn分别取出来
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(validRecords, isFromClient)
         maybeDuplicate.foreach { duplicate =>
           appendInfo.firstOffset = Some(duplicate.firstOffset)
@@ -168,14 +166,13 @@ TODO
           shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
           records = validRecords)
 
-        // update the producer state
+        // 更新Producer的状态，并且将transactions放入ongoingTxns队列中
         for ((producerId, producerAppendInfo) <- updatedProducers) {
           producerAppendInfo.maybeCacheTxnFirstOffsetMetadata(logOffsetMetadata)
           producerStateManager.update(producerAppendInfo)
         }
 
-        // update the transaction index with the true last stable offset. The last offset visible
-        // to consumers using READ_COMMITTED will be limited by this value and the high watermark.
+        // 完成事务
         for (completedTxn <- completedTxns) {
           val lastStableOffset = producerStateManager.completeTxn(completedTxn)
           segment.updateTxnIndex(completedTxn, lastStableOffset)
@@ -191,11 +188,7 @@ TODO
         // update the first unstable offset (which is used to compute LSO)
         updateFirstUnstableOffset()
 
-        trace(s"Appended message set with last offset: ${appendInfo.lastOffset}, " +
-          s"first offset: ${appendInfo.firstOffset}, " +
-          s"next offset: ${nextOffsetMetadata.messageOffset}, " +
-          s"and messages: $validRecords")
-
+        // 上一次检查点到现在累加的数据超过flushInterval则调用flush将缓存中的数据写入磁盘持久化
         if (unflushedMessages >= config.flushInterval)
           flush()
 
@@ -243,14 +236,145 @@ TODO
   }
 ```
 
-　　至此，我们将Produce请求日志写入部分也介绍完了。下面来看Fetch请求处理过程中Broker对日志的读取过程的实现。
+　　至此，我们将Produce请求日志写入部分介绍完了。下面来看Fetch请求处理过程中Broker对日志的读取过程的实现。
 
 ## <a id="Fetch">Fetch</a>
 
+　　为了研读从日志读取数据的源码，这里再一次地贴一下[Kafka Consumer(二)](https://daleizhou.github.io/posts/consume-messages.html)中贴过的ReplicaManager.readFromLocalLog()方法。当时未能结合日志具体实现来深入分析，这里结合新的内容重新讲解一遍。
 
+```scala
+  // ReplicaManager.scala
+  def readFromLocalLog(replicaId: Int,
+                       fetchOnlyFromLeader: Boolean,
+                       readOnlyCommitted: Boolean,
+                       fetchMaxBytes: Int,
+                       hardMaxBytesLimit: Boolean,
+                       readPartitionInfo: Seq[(TopicPartition, PartitionData)],
+                       quota: ReplicaQuota,
+                       isolationLevel: IsolationLevel): Seq[(TopicPartition, LogReadResult)] = {
 
+    def read(tp: TopicPartition, fetchInfo: PartitionData, limitBytes: Int, minOneMessage: Boolean): LogReadResult = {
+      val offset = fetchInfo.fetchOffset
+      val partitionFetchSize = fetchInfo.maxBytes
+      val followerLogStartOffset = fetchInfo.logStartOffset
+
+      brokerTopicStats.topicStats(tp.topic).totalFetchRequestRate.mark()
+      brokerTopicStats.allTopicsStats.totalFetchRequestRate.mark()
+
+      try {
+        trace(s"Fetching log segment for partition $tp, offset $offset, partition fetch size $partitionFetchSize, " +
+          s"remaining response limit $limitBytes" +
+          (if (minOneMessage) s", ignoring response/partition size limits" else ""))
+
+        // decide whether to only fetch from leader
+        val localReplica = if (fetchOnlyFromLeader)
+          getLeaderReplicaIfLocal(tp)
+        else
+          getReplicaOrException(tp)
+
+        val initialHighWatermark = localReplica.highWatermark.messageOffset
+        val lastStableOffset = if (isolationLevel == IsolationLevel.READ_COMMITTED)
+          Some(localReplica.lastStableOffset.messageOffset)
+        else
+          None
+
+        // decide whether to only fetch committed data (i.e. messages below high watermark)
+        val maxOffsetOpt = if (readOnlyCommitted)
+          Some(lastStableOffset.getOrElse(initialHighWatermark))
+        else
+          None
+
+        /* Read the LogOffsetMetadata prior to performing the read from the log.
+         * We use the LogOffsetMetadata to determine if a particular replica is in-sync or not.
+         * Using the log end offset after performing the read can lead to a race condition
+         * where data gets appended to the log immediately after the replica has consumed from it
+         * This can cause a replica to always be out of sync.
+         */
+        val initialLogEndOffset = localReplica.logEndOffset.messageOffset
+        val initialLogStartOffset = localReplica.logStartOffset
+        val fetchTimeMs = time.milliseconds
+        val logReadInfo = localReplica.log match {
+          case Some(log) =>
+            val adjustedFetchSize = math.min(partitionFetchSize, limitBytes)
+
+            // Try the read first, this tells us whether we need all of adjustedFetchSize for this partition
+            val fetch = log.read(offset, adjustedFetchSize, maxOffsetOpt, minOneMessage, isolationLevel)
+
+            // If the partition is being throttled, simply return an empty set.
+            if (shouldLeaderThrottle(quota, tp, replicaId))
+              FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
+            // For FetchRequest version 3, we replace incomplete message sets with an empty one as consumers can make
+            // progress in such cases and don't need to report a `RecordTooLargeException`
+            else if (!hardMaxBytesLimit && fetch.firstEntryIncomplete)
+              FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
+            else fetch
+
+          case None =>
+            error(s"Leader for partition $tp does not have a local log")
+            FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY)
+        }
+
+        LogReadResult(info = logReadInfo,
+                      highWatermark = initialHighWatermark,
+                      leaderLogStartOffset = initialLogStartOffset,
+                      leaderLogEndOffset = initialLogEndOffset,
+                      followerLogStartOffset = followerLogStartOffset,
+                      fetchTimeMs = fetchTimeMs,
+                      readSize = partitionFetchSize,
+                      lastStableOffset = lastStableOffset,
+                      exception = None)
+      } catch {
+        // NOTE: Failed fetch requests metric is not incremented for known exceptions since it
+        // is supposed to indicate un-expected failure of a broker in handling a fetch request
+        case e@ (_: UnknownTopicOrPartitionException |
+                 _: NotLeaderForPartitionException |
+                 _: ReplicaNotAvailableException |
+                 _: KafkaStorageException |
+                 _: OffsetOutOfRangeException) =>
+          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
+                        highWatermark = -1L,
+                        leaderLogStartOffset = -1L,
+                        leaderLogEndOffset = -1L,
+                        followerLogStartOffset = -1L,
+                        fetchTimeMs = -1L,
+                        readSize = partitionFetchSize,
+                        lastStableOffset = None,
+                        exception = Some(e))
+        case e: Throwable =>
+          brokerTopicStats.topicStats(tp.topic).failedFetchRequestRate.mark()
+          brokerTopicStats.allTopicsStats.failedFetchRequestRate.mark()
+          error(s"Error processing fetch operation on partition $tp, offset $offset", e)
+          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
+                        highWatermark = -1L,
+                        leaderLogStartOffset = -1L,
+                        leaderLogEndOffset = -1L,
+                        followerLogStartOffset = -1L,
+                        fetchTimeMs = -1L,
+                        readSize = partitionFetchSize,
+                        lastStableOffset = None,
+                        exception = Some(e))
+      }
+    }
+
+    var limitBytes = fetchMaxBytes
+    val result = new mutable.ArrayBuffer[(TopicPartition, LogReadResult)]
+    var minOneMessage = !hardMaxBytesLimit
+    readPartitionInfo.foreach { case (tp, fetchInfo) =>
+      val readResult = read(tp, fetchInfo, limitBytes, minOneMessage)
+      val recordBatchSize = readResult.info.records.sizeInBytes
+      // Once we read from a non-empty partition, we stop ignoring request and partition level size limits
+      if (recordBatchSize > 0)
+        minOneMessage = false
+      limitBytes = math.max(0, limitBytes - recordBatchSize)
+      result += (tp -> readResult)
+    }
+    result
+  }
+```
 
 ## TODO
+
+## <a id="conclusion">总结</a>
 
 ## <a id="references">References</a>
 
