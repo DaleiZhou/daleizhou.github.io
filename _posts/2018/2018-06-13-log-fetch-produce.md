@@ -56,10 +56,9 @@ TODO
 
 　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的*zigzag*编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
 
+## <a id="Produce">Produce</a>
 
 　　由上述的介绍我们对Kafka的log有了一个直观的印象，前几篇博文对日志的读写部分都一带而过。现在结合Kafka处理的fetch和produce请求最后日志的读写具体的代码细节来进行源码分析。
-
-## <a id="Produce">Produce</a>
 
 ```scala
 //ReplicaManager.scala
@@ -214,21 +213,26 @@ TODO
              shallowOffsetOfMaxTimestamp: Long,
              records: MemoryRecords): Unit = {
     if (records.sizeInBytes > 0) {
-      trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
-            s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
       val physicalPosition = log.sizeInBytes()
+
+      // 如果当前log中数据大小为0，设置rollingBasedTimestamp 为largestTimestamp
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
       // append the messages
       require(canConvertToRelativeOffset(largestOffset), "largest offset in message set can not be safely converted to relative offset.")
+      // 将数据写入log中
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file()} at end offset $largestOffset")
-      // Update the in memory max timestamp and corresponding offset.
+
+
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampSoFar = largestTimestamp
         offsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
+      //bytesSinceLastIndexEntry记录插入的数据的大小的累计，当累计超过indexIntervalBytes时，
+      // 在offsetIndex中增加一条索引记录，以(largestOffset, physicalPosition)作为索引
+      // 并清空累加值，同时尝试添加一条timeIndex记录，当maxTimestampSoFar, offsetOfMaxTimestamp都大于timeIndex中的最后一条记录对应的值
       if(bytesSinceLastIndexEntry > indexIntervalBytes) {
         offsetIndex.append(largestOffset, physicalPosition)
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestamp)
@@ -239,6 +243,7 @@ TODO
   }
 ```
 
+　　至此，我们将Produce请求日志写入部分也介绍完了。下面来看Fetch请求处理过程中Broker对日志的读取过程的实现。
 
 ## <a id="Fetch">Fetch</a>
 
