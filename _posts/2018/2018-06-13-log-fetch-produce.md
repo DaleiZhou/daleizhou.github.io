@@ -57,7 +57,188 @@ TODO
 　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的*zigzag*编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
 
 
-由上述的介绍我们对Kafka的log有了一个直观的印象，现在结合Kafka处理的fetch和produce请求最后日志的读写具体的代码细节来进行源码分析。
+　　由上述的介绍我们对Kafka的log有了一个直观的印象，前几篇博文对日志的读写部分都一带而过。现在结合Kafka处理的fetch和produce请求最后日志的读写具体的代码细节来进行源码分析。
+
+## <a id="Produce">Produce</a>
+
+```scala
+//ReplicaManager.scala
+  private def append(records: MemoryRecords, isFromClient: Boolean, assignOffsets: Boolean, leaderEpoch: Int): LogAppendInfo = {
+    maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+      //对消息进行校验，每条消息校验CRC，size,
+      //并且该方法返回LogAppendInfo，其中包含第一条和最后一条record的offset,records数目，validBytesCount，offset是否是单调递增等信息
+      val appendInfo = analyzeAndValidateRecords(records, isFromClient = isFromClient)
+
+      // 没有可以append的信息直接返回
+      if (appendInfo.shallowCount == 0)
+        return appendInfo
+
+      // 将未通过验证的消息数据trim掉
+      var validRecords = trimInvalidBytes(records, appendInfo)
+
+      // 将验证通过的消息插入日志中
+      lock synchronized {
+        checkIfMemoryMappedBufferClosed()
+        if (assignOffsets) {
+          // 需要为record进行设置offset和MaxTimestamp
+          val offset = new LongRef(nextOffsetMetadata.messageOffset)
+          //得到第一条消息的offset
+          appendInfo.firstOffset = Some(offset.value)
+          //服务器当前时间作为时间戳
+          val now = time.milliseconds
+          val validateAndOffsetAssignResult = try {
+            LogValidator.validateMessagesAndAssignOffsets(validRecords,
+              offset,
+              time,
+              now,
+              appendInfo.sourceCodec,
+              appendInfo.targetCodec,
+              config.compact,
+              config.messageFormatVersion.recordVersion.value,
+              config.messageTimestampType,
+              config.messageTimestampDifferenceMaxMs,
+              leaderEpoch,
+              isFromClient)
+          } catch {
+            case e: IOException =>
+              throw new KafkaException(s"Error validating messages while appending to log $name", e)
+          }
+
+          //根据重新赋值过的offset和timestamp更新appendInfo成实际的值
+          validRecords = validateAndOffsetAssignResult.validatedRecords
+          appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
+          appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
+          appendInfo.lastOffset = offset.value - 1
+          appendInfo.recordsProcessingStats = validateAndOffsetAssignResult.recordsProcessingStats
+          if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
+            appendInfo.logAppendTime = now
+
+          // 如果存在压缩或者是格式转换，消息的大小需要重新验证
+          if (validateAndOffsetAssignResult.messageSizeMaybeChanged) {
+            for (batch <- validRecords.batches.asScala) {
+              if (batch.sizeInBytes > config.maxMessageSize) {
+                // record && throw RecordTooLargeException()
+                // other code ...
+              }
+            }
+          }
+        } else {
+          // offset非单调增加或者是appendInfo的firstOffset or lastOffset < 已存在的offset 则抛异常
+          if (!appendInfo.offsetsMonotonic || appendInfo.firstOrLastOffset < nextOffsetMetadata.messageOffset)
+            throw new IllegalArgumentException(s"Out of order offsets found in append to $topicPartition: " +
+              records.records.asScala.map(_.offset))
+        }
+
+        // update the epoch cache with the epoch stamped onto the message by the leader
+        validRecords.batches.asScala.foreach { batch =>
+          if (batch.magic >= RecordBatch.MAGIC_VALUE_V2)
+            _leaderEpochCache.assign(batch.partitionLeaderEpoch, batch.baseOffset)
+        }
+
+        // 消息大小超过了配置的segment的大小，数据大，一个装不下，抛异常
+        if (validRecords.sizeInBytes > config.segmentSize) {
+          throw new RecordBatchTooLargeException(s"Message batch size is ${validRecords.sizeInBytes} bytes in append " +
+            s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
+        }
+
+        // now that we have valid records, offsets assigned, and timestamps updated, we need to
+        // validate the idempotent/transactional state of the producers and collect some metadata
+        // analyzeAndValidateProducerState方法中过滤一遍validRecords，
+        // 将重复的，可更新状态的，可完成的txn分别取出来
+        val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(validRecords, isFromClient)
+        maybeDuplicate.foreach { duplicate =>
+          appendInfo.firstOffset = Some(duplicate.firstOffset)
+          appendInfo.lastOffset = duplicate.lastOffset
+          appendInfo.logAppendTime = duplicate.timestamp
+          appendInfo.logStartOffset = logStartOffset
+          return appendInfo
+        }
+
+        //LogSegment.shouldRoll()方法判断是否需要生成一个新的Segment: 当前Segment剩余空间不足以容纳 or 当前segment不为空但等待时间已到
+        // or offsetIndex/timeIndex索引文件满了，or offset相对于base_offset超过int32.max_value
+        val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
+
+        val logOffsetMetadata = LogOffsetMetadata(
+          messageOffset = appendInfo.firstOrLastOffset,
+          segmentBaseOffset = segment.baseOffset,
+          relativePositionInSegment = segment.size)
+
+        //在当前的segment中append消息
+        segment.append(largestOffset = appendInfo.lastOffset,
+          largestTimestamp = appendInfo.maxTimestamp,
+          shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
+          records = validRecords)
+
+        // update the producer state
+        for ((producerId, producerAppendInfo) <- updatedProducers) {
+          producerAppendInfo.maybeCacheTxnFirstOffsetMetadata(logOffsetMetadata)
+          producerStateManager.update(producerAppendInfo)
+        }
+
+        // update the transaction index with the true last stable offset. The last offset visible
+        // to consumers using READ_COMMITTED will be limited by this value and the high watermark.
+        for (completedTxn <- completedTxns) {
+          val lastStableOffset = producerStateManager.completeTxn(completedTxn)
+          segment.updateTxnIndex(completedTxn, lastStableOffset)
+        }
+
+        // always update the last producer id map offset so that the snapshot reflects the current offset
+        // even if there isn't any idempotent data being written
+        producerStateManager.updateMapEndOffset(appendInfo.lastOffset + 1)
+
+        // increment the log end offset
+        updateLogEndOffset(appendInfo.lastOffset + 1)
+
+        // update the first unstable offset (which is used to compute LSO)
+        updateFirstUnstableOffset()
+
+        trace(s"Appended message set with last offset: ${appendInfo.lastOffset}, " +
+          s"first offset: ${appendInfo.firstOffset}, " +
+          s"next offset: ${nextOffsetMetadata.messageOffset}, " +
+          s"and messages: $validRecords")
+
+        if (unflushedMessages >= config.flushInterval)
+          flush()
+
+        appendInfo
+      }
+    }
+  }
+```
+　　ReplicaManager.append()方法中首先验证消息的合法性，并将没有通过检验的部分tirm掉。并根据得到的Record集合更新offset,timestamp等信息。如果保留的数据大小超过当前Segment剩余的空间或者是其它如offset过大等都会触发日志的roll行为。即生成一个新的Segment并作为当前Segment。Record的append操作都是在当前Segment中进行，经过上述一系列的操作之后调用LogSegment.append()方法将内存Record写入Segment中。
+
+```scala
+//LogSegment.scala
+  def append(largestOffset: Long,
+             largestTimestamp: Long,
+             shallowOffsetOfMaxTimestamp: Long,
+             records: MemoryRecords): Unit = {
+    if (records.sizeInBytes > 0) {
+      trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
+            s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
+      val physicalPosition = log.sizeInBytes()
+      if (physicalPosition == 0)
+        rollingBasedTimestamp = Some(largestTimestamp)
+      // append the messages
+      require(canConvertToRelativeOffset(largestOffset), "largest offset in message set can not be safely converted to relative offset.")
+      val appendedBytes = log.append(records)
+      trace(s"Appended $appendedBytes to ${log.file()} at end offset $largestOffset")
+      // Update the in memory max timestamp and corresponding offset.
+      if (largestTimestamp > maxTimestampSoFar) {
+        maxTimestampSoFar = largestTimestamp
+        offsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp
+      }
+      // append an entry to the index (if needed)
+      if(bytesSinceLastIndexEntry > indexIntervalBytes) {
+        offsetIndex.append(largestOffset, physicalPosition)
+        timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestamp)
+        bytesSinceLastIndexEntry = 0
+      }
+      bytesSinceLastIndexEntry += records.sizeInBytes
+    }
+  }
+```
+
 
 ## <a id="Fetch">Fetch</a>
 
