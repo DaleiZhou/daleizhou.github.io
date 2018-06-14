@@ -20,8 +20,25 @@ title: Log Management
 ## <a id="Kafka Log">Kafka Log</a>
 　　下面我们来看一下TopicPartition的示意图。
 
+<div align="center">
 <img src="/assets/img/2018/06/13/Anatomy_of_a_topic.png" />
+</div>
 
+　　由上图我们可以看到，每个TopicPartition由一系列的Segment组成。这些Segment会在日志文件夹中有对应的日志文件、索引文件等。下面我们看笔者运行的集群的某个Partition对应的log文件夹内容:
+
+```sh
+ll
+
+
+```
+
+　　每个Segment都对应着base_offset.index,base_offset.log文件。这个base_offset代表这个Segment消息在整个消息中的基准偏移量，他会小于等于这个Segment中所有的消息的偏移，也严格大于前一个Segment中所有消息的偏移量。
+
+　　从Kafka 0.11开始，改变了原来Message的称呼，现在log中写入的数据称为Record。以RecordBatch为单位写入，每个Batch中至少有一个Record。下图是根据源码中描绘的log中RecordBatch的数据结构:
+
+<div align="center">
+<img src="/assets/img/2018/06/13/RecordStruct.png" />
+</div>
 
 
 ## TODO
