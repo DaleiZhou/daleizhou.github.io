@@ -43,6 +43,10 @@ ll
 
 ## TODO
 
+## <a id="references">References</a>
+
+* https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Messagesets
+
 
 
 
