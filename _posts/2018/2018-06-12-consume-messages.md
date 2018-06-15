@@ -396,7 +396,7 @@ title: Kafka Consumer(二)
   }
 ```
 
-　　ReplicaManager.readFromLocalLog()方法中主要地调用了log.read()方法从日志中读取消息。该方法从不大于startOffset的那个segment开始读取数据，如果未读满并且还有未读取的segment,依次向前遍历读取，最后拼接结果给客户端返回。
+　　ReplicaManager.readFromLocalLog()方法中主要地调用了log.read()方法从日志中读取消息。该方法从不大于startOffset的那个segment开始读取数据，如果从选定的Segment中未读到数据,依次向前取下一个Segment读取，最后拼接结果给客户端返回。
 
 ## <a id="conclusion">总结</a>
 

@@ -326,35 +326,7 @@ TODO
                       lastStableOffset = lastStableOffset,
                       exception = None)
       } catch {
-        // NOTE: Failed fetch requests metric is not incremented for known exceptions since it
-        // is supposed to indicate un-expected failure of a broker in handling a fetch request
-        case e@ (_: UnknownTopicOrPartitionException |
-                 _: NotLeaderForPartitionException |
-                 _: ReplicaNotAvailableException |
-                 _: KafkaStorageException |
-                 _: OffsetOutOfRangeException) =>
-          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
-                        highWatermark = -1L,
-                        leaderLogStartOffset = -1L,
-                        leaderLogEndOffset = -1L,
-                        followerLogStartOffset = -1L,
-                        fetchTimeMs = -1L,
-                        readSize = partitionFetchSize,
-                        lastStableOffset = None,
-                        exception = Some(e))
-        case e: Throwable =>
-          brokerTopicStats.topicStats(tp.topic).failedFetchRequestRate.mark()
-          brokerTopicStats.allTopicsStats.failedFetchRequestRate.mark()
-          error(s"Error processing fetch operation on partition $tp, offset $offset", e)
-          LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
-                        highWatermark = -1L,
-                        leaderLogStartOffset = -1L,
-                        leaderLogEndOffset = -1L,
-                        followerLogStartOffset = -1L,
-                        fetchTimeMs = -1L,
-                        readSize = partitionFetchSize,
-                        lastStableOffset = None,
-                        exception = Some(e))
+        // 异常处理 ...
       }
     }
 
@@ -374,6 +346,7 @@ TODO
   }
 ```
 
+　　ReplicaManager遍历需要读取的TopicPartiton调用内部read()方法逐一对Tp对应的log进行读取。如果读取到
 
 ```scala
   //Log.scala
@@ -405,30 +378,34 @@ TODO
         throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
           s"but we only have log segments in the range $logStartOffset to $next.")
 
+      // 在segment中读取，如果当前segment根据传入的offset, size等参数无法读取数据，则向前获取下一个segment读取
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
 
-        // If the fetch occurs on the active segment, there might be a race condition where two fetch requests occur after
-        // the message is appended but before the nextOffsetMetadata is updated. In that case the second fetch may
-        // cause OffsetOutOfRangeException. To solve that, we cap the reading up to exposed position instead of the log
-        // end of the active segment.
+        // 如果当前segment为active segment, 则需要考虑在读取时有数据进行append,但是在更新nextOffsetMetadata之前有两个fetch请求，这样可能会导致OffsetOutOfRangeException， 因此缓存当前的位置，只读到现在的位置就结束
         val maxPosition = {
           if (segmentEntry == segments.lastEntry) {
             val exposedPos = nextOffsetMetadata.relativePositionInSegment.toLong
-            // Check the segment again in case a new segment has just rolled out.
+            
+            // 可能在此时已经发生了roll动作，当前segment已经不为active segment，则直接将log.sizeInBytes() 作为maxPosition，
+            // 否则将刚刚缓存缓存的日志的相对结尾位置作为maxPosition
             if (segmentEntry != segments.lastEntry)
             // New log segment has rolled out, we can read up to the file end.
               segment.size
             else
               exposedPos
           } else {
+            // 如果不是最后一个segment,即不存在读写竞争则maxPosition = log.sizeInBytes()
             segment.size
           }
         }
         val fetchInfo = segment.read(startOffset, maxOffset, maxLength, maxPosition, minOneMessage)
         if (fetchInfo == null) {
+          // 读取结果为null，取下一个Segment进行读取，直到读到数据 or 直到没有segment可读
           segmentEntry = segments.higherEntry(segmentEntry.getKey)
         } else {
+          // 如果隔离级别为读未提交，则直接返回读到的结果，
+          // 如果隔离级别为读提交，则addAbortedTransactions
           return isolationLevel match {
             case IsolationLevel.READ_UNCOMMITTED => fetchInfo
             case IsolationLevel.READ_COMMITTED => addAbortedTransactions(startOffset, segmentEntry, fetchInfo)
@@ -436,13 +413,13 @@ TODO
         }
       }
 
-      // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
-      // this can happen when all messages with offset larger than start offsets have been deleted.
-      // In this case, we will return the empty set with log end offset metadata
+      // 如果执行到这里，没有读取到数据， 返回empty
       FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
     }
   }
 ```
+
+　　定位到具体的开始读取的Segment之后调用LogSegment.read()方法进行record的读取。在必要的offset边界条件检查后，因为读取未加锁，如果读取是在ActiveSegment上读取，缓存当前Segment的最大位置作为读取的边界。在指定的Segment上通过LogSegment.read()方法可以进行数据的读取，如果当前Segment未能读取则依次读取下一个Segment，如果读取成功则再根据隔离级别做结果的调整。
 
 ```scala
   //LogSegment.scala
