@@ -11,11 +11,11 @@ title: Kafka log的读写分析
 
 　　前面几篇中对于Fetch,Produce请求的日志的读写都只是泛泛的略过，本篇介绍Kafka的日志相关的设计细节。通过本章的学习也可以重新回过头去将前几篇完善一下。
 
-　　熟悉Kafka的同学都知道，Kafka的消息的读写都是存放在log文件中。一个broker的log文件放在一个目录下，而不同的Partition对应一个子目录，发送到broker上的消息将会顺序的append到对应的Partition对应的log文件中。每个Partition对应的log文件可以看成是无限长、可以在文件末尾进行append数据的文件，加速写入速度。实际实现中，每个Partition对应的日志文件又被切分成多个Segment，这种切分的设计可以在数据的清理，控制索引文件大小等方面带来优势。
-
 　　为了对某个具体Topic的读写的负载均衡，Kafka的一个Topic可以分为多个Partition，不同的Partition可以分布在不同的broker，方便的实现水平拓展，减轻读写瓶颈。通过前面几篇博文的分析我们知道正常情况下Kafka保证一条消息只发送到一个分区，并且一个分区的一条消息只能由Group下的唯一一个Consumer消费，如果想重复消费则可以加入一个新的组。
 
-　　因为分布式环境下的任何一个Broker都有宕机的风险，所以Kafka上每个Partition有可以设置多个副本，通过副本的主从选举，副本的主从同步等手段，保证数据的高可用，降低由于部分broker宕机带来的影响，当然为了达到这个目的，同一个Partition副本应该分布在不同的Broker、机架上。这部分不是本文的重点，后面有专门章节介绍主从同步。
+　　熟悉Kafka的同学都知道，Kafka的消息的读写都是存放在log文件中。一个broker的log文件放在一个目录下，而不同的Partition对应一个子目录，发送到broker上的消息将会顺序的append到对应的Partition对应的log文件中。每个Partition对应的log文件可以看成是无限长、可以在文件末尾进行append数据的文件，加速写入速度。实际实现中，每个Partition对应的日志文件又被切分成多个Segment，这种切分的设计可以在数据的清理，控制索引文件大小等方面带来优势。
+
+　　因为分布式环境下的任何一个Broker都有宕机的风险，所以Kafka上每个Partition有可以设置多个副本，通过副本的主从选举，副本的主从同步等手段，保证数据的高可用，降低由于部分broker宕机带来的影响，当然为了达到这个目的，同一个Partition副本应该分布在不同的Broker、机架上，通过一定的分配算法来使得分布尽量分散。这部分不是本文的重点，后面有专门章节介绍主从同步。
 
 ## <a id="Kafka Log">Kafka Log</a>
 
@@ -425,55 +425,72 @@ TODO
   //LogSegment.scala
   def read(startOffset: Long, maxOffset: Option[Long], maxSize: Int, maxPosition: Long = size,
            minOneMessage: Boolean = false): FetchDataInfo = {
-    if (maxSize < 0)
-      throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
+    // 参数检查，要求maxSize不小于0，否则抛参数异常
+    // other code ...
 
-    val logSize = log.sizeInBytes // this may change, need to save a consistent copy
+    // 读取过程中log的size会随着别的线程而改变，因此缓存下来
+    val logSize = log.sizeInBytes
+
+    // 通过translateOffset方法找到第一个offset >= startOffset的record
+    // 这个方法下面会详细讲解
     val startOffsetAndSize = translateOffset(startOffset)
 
-    // if the start position is already off the end of the log, return null
+    // 如果start的位置超过了end,则startOffsetAndSize为null，直接返回null，让外层读取下一个Segment
     if (startOffsetAndSize == null)
       return null
 
     val startPosition = startOffsetAndSize.position
     val offsetMetadata = new LogOffsetMetadata(startOffset, this.baseOffset, startPosition)
 
+    // 如果设置了minOneMessage， 则adjustedMaxSize尽量的大，尽量至少读取一个record,即便超过maxSize
+    // 否则读取数据量大小上限设置为maxSize
     val adjustedMaxSize =
       if (minOneMessage) math.max(maxSize, startOffsetAndSize.size)
       else maxSize
 
-    // return a log segment but with zero size in the case below
+    // 如果空segment,则直接返回空结果
     if (adjustedMaxSize == 0)
       return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
 
-    // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    // 获取本次读取的size
     val fetchSize: Int = maxOffset match {
+      // 如果maxSize没有指定，则读取消息直到最大的position
       case None =>
-        // no max offset, just read until the max position
         min((maxPosition - startPosition).toInt, adjustedMaxSize)
       case Some(offset) =>
         // there is a max offset, translate it to a file position and use that to calculate the max read size;
         // when the leader of a partition changes, it's possible for the new leader's high watermark to be less than the
         // true high watermark in the previous leader for a short window. In this window, if a consumer fetches on an
         // offset between new leader's high watermark and the log end offset, we want to return an empty response.
-        if (offset < startOffset)
+        // 最大位置小于读取的起始位置，则返回空结果
+        if (offset < startOffset)】
           return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY, firstEntryIncomplete = false)
+        // 生成结束位置的position信息
         val mapping = translateOffset(offset, startPosition)
         val endPosition =
           if (mapping == null)
             logSize // the max offset is off the end of the log, use the end of the file
           else
             mapping.position
+        // min(maxPosition, endPosition) - startPosition 与adjustedMaxSize 的最小值作为本次读取的大小
         min(min(maxPosition, endPosition) - startPosition, adjustedMaxSize).toInt
     }
-
+    // 根据startPosition和fetchsize调用log.read()方法从日志中读取数据
     FetchDataInfo(offsetMetadata, log.read(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
+
+  private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
+    val mapping = offsetIndex.lookup(offset)
+    log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
+  }
 ```
-## TODO
+
+　　至此，Kafka的Broker端对消息的读取的过程也分析完毕。
 
 ## <a id="conclusion">总结</a>
+
+　　本文从Kafka的日志的实际结构切入，介绍了一个正常的Topic的不通Partition的分布及
 
 ## <a id="references">References</a>
 
