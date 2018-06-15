@@ -26,7 +26,7 @@ title: Kafka log的读写分析
 <img src="/assets/img/2018/06/13/Anatomy_of_a_topic.png" />
 </div>
 
-　　由上图我们可以看到，每个TopicPartition由一系列的Segment组成。这些Segment会在日志文件夹中有对应的日志文件、索引文件等。下面我们看笔者运行的集群的某个Partition对应的log文件夹内容:
+　　由上图我们可以看到，每个TopicPartition由一系列的Segment组成。这些Segment会在日志文件夹中有对应的日志文件、索引文件等。下面我们看某个Partition对应的log文件夹内容的示意文件列表:
 
 ```sh
 ll
@@ -382,10 +382,10 @@ TODO
     maybeHandleIOException(s"Exception while reading from $topicPartition in dir ${dir.getParent}") {
       trace(s"Reading $maxLength bytes from offset $startOffset of length $size bytes")
 
-      // Because we don't use lock for reading, the synchronization is a little bit tricky.
-      // We create the local variables to avoid race conditions with updates to the log.
+      // 因为读不加锁，所以讲offsetMetadata复制出来避免成为临界资源
       val currentNextOffsetMetadata = nextOffsetMetadata
       val next = currentNextOffsetMetadata.messageOffset
+      // 如果读取开始的offset == 日志最后的偏移量，即没有消息可读，立即返回结果
       if (startOffset == next) {
         val abortedTransactions =
           if (isolationLevel == IsolationLevel.READ_COMMITTED) Some(List.empty[AbortedTransaction])
@@ -394,16 +394,17 @@ TODO
           abortedTransactions = abortedTransactions)
       }
 
+      // 获取到base_offset小于等于startOffset的那个segment，将读取的开始位置定位到具体的segment
       var segmentEntry = segments.floorEntry(startOffset)
 
-      // return error on attempt to read beyond the log end offset or read below log start offset
+      // 如果开始读取的startOffset > log最后的offset or
+      // segmentEntry不存在 or
+      // 读取的开始 < logStartOffset (日志清理等造成了起始位置不可读)
+      // 复核上述情况之一则抛异常提示读取范围超过有效范围
       if (startOffset > next || segmentEntry == null || startOffset < logStartOffset)
         throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
           s"but we only have log segments in the range $logStartOffset to $next.")
 
-      // Do the read on the segment with a base offset less than the target offset
-      // but if that segment doesn't contain any messages with an offset greater than that
-      // continue to read from successive segments until we get some messages or we reach the end of the log
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
 
@@ -440,6 +441,57 @@ TODO
       // In this case, we will return the empty set with log end offset metadata
       FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
     }
+  }
+```
+
+```scala
+  //LogSegment.scala
+  def read(startOffset: Long, maxOffset: Option[Long], maxSize: Int, maxPosition: Long = size,
+           minOneMessage: Boolean = false): FetchDataInfo = {
+    if (maxSize < 0)
+      throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
+
+    val logSize = log.sizeInBytes // this may change, need to save a consistent copy
+    val startOffsetAndSize = translateOffset(startOffset)
+
+    // if the start position is already off the end of the log, return null
+    if (startOffsetAndSize == null)
+      return null
+
+    val startPosition = startOffsetAndSize.position
+    val offsetMetadata = new LogOffsetMetadata(startOffset, this.baseOffset, startPosition)
+
+    val adjustedMaxSize =
+      if (minOneMessage) math.max(maxSize, startOffsetAndSize.size)
+      else maxSize
+
+    // return a log segment but with zero size in the case below
+    if (adjustedMaxSize == 0)
+      return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
+
+    // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    val fetchSize: Int = maxOffset match {
+      case None =>
+        // no max offset, just read until the max position
+        min((maxPosition - startPosition).toInt, adjustedMaxSize)
+      case Some(offset) =>
+        // there is a max offset, translate it to a file position and use that to calculate the max read size;
+        // when the leader of a partition changes, it's possible for the new leader's high watermark to be less than the
+        // true high watermark in the previous leader for a short window. In this window, if a consumer fetches on an
+        // offset between new leader's high watermark and the log end offset, we want to return an empty response.
+        if (offset < startOffset)
+          return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY, firstEntryIncomplete = false)
+        val mapping = translateOffset(offset, startPosition)
+        val endPosition =
+          if (mapping == null)
+            logSize // the max offset is off the end of the log, use the end of the file
+          else
+            mapping.position
+        min(min(maxPosition, endPosition) - startPosition, adjustedMaxSize).toInt
+    }
+
+    FetchDataInfo(offsetMetadata, log.read(startPosition, fetchSize),
+      firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
 ```
 ## TODO
