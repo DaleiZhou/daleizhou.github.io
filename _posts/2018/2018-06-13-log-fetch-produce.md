@@ -39,7 +39,7 @@ TODO
 　　因为Kafka对数据的处理是抽象为在一个无限长的日志文件后进行追加操作。因此为了能迅速检索到某个指定offset对应的消息，Kafka对日志文件都进行了索引。每个日志的Segment相应地对应一个索引文件OffsetIndex。下面来看索引及消息在某个具体Segment的示意结构图:
 
 <div align="center">
-<img src="/assets/img/2018/06/13/SegmentIndexAndLog.jpeg" />
+<img src="/assets/img/2018/06/13/SegmentIndexAndLog.jpeg" width="60%" height="60%"/>
 </div>
 
 　　从图上看每个日志的segment对应一个index文件。index文件是稀疏的，即并不是每一个Record都会对应index文件里的一条，这样的设计可以有效的减小index文件的大小，使得可以载入内存，在内存中进行比较运算，虽然可能不能直接根据index直接找到某一个record,但是可以先通过二分的形式找到不大于要检索的offset的那个index记录，然后再往后顺序遍历即可找到。
