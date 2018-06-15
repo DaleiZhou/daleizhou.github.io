@@ -23,15 +23,19 @@ title: Kafka log的读写分析
 　　下面我们来看一下TopicPartition的示意图。
 
 <div align="center">
-<img src="/assets/img/2018/06/13/Anatomy_of_a_topic.png" />
+<img src="/assets/img/2018/06/13/Anatomy_of_a_topic.jpeg" width="40%" height="40%"/>
 </div>
 
 　　由上图我们可以看到，每个TopicPartition由一系列的Segment组成。这些Segment会在日志文件夹中有对应的日志文件、索引文件等。下面我们看某个Partition对应的log文件夹内容的示意文件列表:
 
 ```sh
-ll
-
-TODO
+log git:(master) ✗ ls
+00000000000000000000.index
+00000000000000000000.log
+00000000000000043023.index
+00000000000000043023.log
+00000000000000090023.index
+00000000000000090023.log
 ```
 
 　　每个Segment都对应着base_offset.index,base_offset.log文件。这个base_offset代表这个Segment消息在整个消息中的基准偏移量，他会小于等于这个Segment中所有的消息的偏移，也严格大于前一个Segment中所有消息的偏移量。
@@ -42,7 +46,7 @@ TODO
 <img src="/assets/img/2018/06/13/SegmentIndexAndLog.jpeg" width="40%" height="40%"/>
 </div>
 
-　　从图上看每个日志的segment对应一个index文件。index文件是稀疏的，即并不是每一个Record都会对应index文件里的一条，这样的设计可以有效的减小index文件的大小，使得可以载入内存，在内存中进行比较运算，虽然可能不能直接根据index直接找到某一个record,但是可以先通过二分的形式找到不大于要检索的offset的那个index记录，然后再往后顺序遍历即可找到。
+　　从图上看每个日志的segment对应一个index文件。index文件是稀疏的，即并不是每一个Record都会对应index文件里的一条，这样的设计可以有效的减小index文件的大小，使得可以载入内存，在内存中进行比较运算，虽然可能不能直接根据index直接找到某一个record,但是可以先通过二分的形式找到不大于要检索的offset的那个index记录，然后再往后顺序遍历即可找到。较新版本的Kafka还给每个Segment会配置TimeStampIndex，与OffsetIndex结构类似，区别是TimeStampIndex组成为8字节的时间戳和4字节的location。
 
 　　Index的格式为8个字节组成一条记录，其中前4个字节标识消息在该Segment中的相对offset,后4个字节标识该消息在该Segment中的相对位置。
 
@@ -51,7 +55,7 @@ TODO
 　　从Kafka 0.11开始，改变了原来Message的称呼，现在log中写入的数据称为Record。以RecordBatch为单位写入，每个Batch中至少有一个Record。下图是根据源码中描绘的log中RecordBatch的数据结构:
 
 <div align="center">
-<img src="/assets/img/2018/06/13/RecordStruct.png" />
+<img src="/assets/img/2018/06/13/RecordStruct.jpeg" width="40%" height="40%"/>
 </div>
 
 　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的*zigzag*编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
@@ -61,7 +65,7 @@ TODO
 　　由上述的介绍我们对Kafka的log有了一个直观的印象，前几篇博文对日志的读写部分都一带而过。现在结合Kafka处理的fetch和produce请求最后日志的读写具体的代码细节来进行源码分析。
 
 ```scala
-//ReplicaManager.scala
+  //Log.scala
   private def append(records: MemoryRecords, isFromClient: Boolean, assignOffsets: Boolean, leaderEpoch: Int): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
       //对消息进行校验，每条消息校验CRC，size,
@@ -200,7 +204,7 @@ TODO
 　　ReplicaManager.append()方法中首先验证消息的合法性，并将没有通过检验的部分tirm掉。并根据得到的Record集合更新offset,timestamp等信息。如果保留的数据大小超过当前Segment剩余的空间或者是其它如offset过大等都会触发日志的roll行为。即生成一个新的Segment并作为当前Segment。Record的append操作都是在当前Segment中进行，经过上述一系列的操作之后调用LogSegment.append()方法将内存Record写入Segment中。
 
 ```scala
-//LogSegment.scala
+  //LogSegment.scala
   def append(largestOffset: Long,
              largestTimestamp: Long,
              shallowOffsetOfMaxTimestamp: Long,
@@ -280,42 +284,36 @@ TODO
         else
           None
 
-        // decide whether to only fetch committed data (i.e. messages below high watermark)
+        // 根据是否只读committed来设置读取的最大offset,否则没有上限，后面具体读取时会被
         val maxOffsetOpt = if (readOnlyCommitted)
           Some(lastStableOffset.getOrElse(initialHighWatermark))
         else
           None
 
-        /* Read the LogOffsetMetadata prior to performing the read from the log.
-         * We use the LogOffsetMetadata to determine if a particular replica is in-sync or not.
-         * Using the log end offset after performing the read can lead to a race condition
-         * where data gets appended to the log immediately after the replica has consumed from it
-         * This can cause a replica to always be out of sync.
-         */
         val initialLogEndOffset = localReplica.logEndOffset.messageOffset
         val initialLogStartOffset = localReplica.logStartOffset
         val fetchTimeMs = time.milliseconds
         val logReadInfo = localReplica.log match {
           case Some(log) =>
+            // 调整读取大小的上限
             val adjustedFetchSize = math.min(partitionFetchSize, limitBytes)
 
-            // Try the read first, this tells us whether we need all of adjustedFetchSize for this partition
+            // 从log中读取数据
             val fetch = log.read(offset, adjustedFetchSize, maxOffsetOpt, minOneMessage, isolationLevel)
 
-            // If the partition is being throttled, simply return an empty set.
+            // 限速处理
             if (shouldLeaderThrottle(quota, tp, replicaId))
               FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
-            // For FetchRequest version 3, we replace incomplete message sets with an empty one as consumers can make
-            // progress in such cases and don't need to report a `RecordTooLargeException`
+            // 异常处理
             else if (!hardMaxBytesLimit && fetch.firstEntryIncomplete)
               FetchDataInfo(fetch.fetchOffsetMetadata, MemoryRecords.EMPTY)
             else fetch
 
           case None =>
-            error(s"Leader for partition $tp does not have a local log")
-            FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY)
+            // 异常处理 ...
         }
 
+        // 单次对TopicPartiton读取结果
         LogReadResult(info = logReadInfo,
                       highWatermark = initialHighWatermark,
                       leaderLogStartOffset = initialLogStartOffset,
@@ -336,7 +334,7 @@ TODO
     readPartitionInfo.foreach { case (tp, fetchInfo) =>
       val readResult = read(tp, fetchInfo, limitBytes, minOneMessage)
       val recordBatchSize = readResult.info.records.sizeInBytes
-      // Once we read from a non-empty partition, we stop ignoring request and partition level size limits
+      // 如果一旦读到至少一条消息，minOneMessage这个标志已经没有作用，因此设置为false,后续的Partition就不需要至少读取一条
       if (recordBatchSize > 0)
         minOneMessage = false
       limitBytes = math.max(0, limitBytes - recordBatchSize)
@@ -346,7 +344,7 @@ TODO
   }
 ```
 
-　　ReplicaManager遍历需要读取的TopicPartiton调用内部read()方法逐一对Tp对应的log进行读取。如果读取到
+　　ReplicaManager遍历需要读取的TopicPartiton调用内部read()方法逐一对Tp对应的log进行读取。如果读取到的数据量大小达到了获取的最小限制，则返回结构，否则继续读取。每一轮读取过程中实际会调用Log.read()方法根据其实位置，最长大小等信息读取记录，代码如下:
 
 ```scala
   //Log.scala
@@ -458,12 +456,8 @@ TODO
       case None =>
         min((maxPosition - startPosition).toInt, adjustedMaxSize)
       case Some(offset) =>
-        // there is a max offset, translate it to a file position and use that to calculate the max read size;
-        // when the leader of a partition changes, it's possible for the new leader's high watermark to be less than the
-        // true high watermark in the previous leader for a short window. In this window, if a consumer fetches on an
-        // offset between new leader's high watermark and the log end offset, we want to return an empty response.
-        // 最大位置小于读取的起始位置，则返回空结果
-        if (offset < startOffset)】
+        // 可能由于主从切换，当前HM小于前Leader的HM,会导致offset < startOffset发生，最大位置小于读取的起始位置，则返回空结果
+        if (offset < startOffset)
           return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY, firstEntryIncomplete = false)
         // 生成结束位置的position信息
         val mapping = translateOffset(offset, startPosition)
@@ -480,8 +474,15 @@ TODO
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
 
+  // 找到第一条offset >= 传入的offset的record
   private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
+    // 在当前LogSegment对应的offsetIndex中，调用offsetIndex.lookup()方法通过二分查找，找到offset <= 传入的offset，该方法返回Pair(offset, 该消息在log中相对的物理地址)
+    // 如果offsetIndex找不到符合条件的记录，则返回(base_offset,0)
     val mapping = offsetIndex.lookup(offset)
+
+    // startingFilePosition用于控制跳过不必要的起始检索位置，如果缺省默认取0，
+    // 与mapping.position去较大值作为真正的起始检索位置
+    // log.searchForOffsetWithSize()从真正其实位置开始找到第一个大于等于offset的recotrBatch，返回相关信息作为读取消息的LogOffsetPosition
     log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
   }
 ```
@@ -490,7 +491,7 @@ TODO
 
 ## <a id="conclusion">总结</a>
 
-　　本文从Kafka的日志的实际结构切入，介绍了一个正常的Topic的不通Partition的分布及
+　　本文从Kafka的日志的实际结构切入，介绍了一个正常的Topic的不同Partition的分布及Segment的结构和每个Segment中具体的消息的结构示意。在这些概念的基础上，本文后半部分对前面的ProduceRequest，FetchRequest的日志处理部分做了源码分析，对于前面的几篇博文也是一个补充分析。
 
 ## <a id="references">References</a>
 
