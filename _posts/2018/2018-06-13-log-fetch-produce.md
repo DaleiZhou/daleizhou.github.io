@@ -23,7 +23,7 @@ title: Kafka log的读写分析
 　　下面我们来看一下TopicPartition的示意图。
 
 <div align="center">
-<img src="/assets/img/2018/06/13/Anatomy_of_a_topic.jpeg" width="40%" height="40%"/>
+<img src="/assets/img/2018/06/13/Anatomy_of_a_topic.jpeg" width="60%" height="60%"/>
 </div>
 
 　　由上图我们可以看到，每个TopicPartition由一系列的Segment组成。这些Segment会在日志文件夹中有对应的日志文件、索引文件等。下面我们看某个Partition对应的log文件夹内容的示意文件列表:
@@ -55,7 +55,7 @@ log git:(master) ✗ ls
 　　从Kafka 0.11开始，改变了原来Message的称呼，现在log中写入的数据称为Record。以RecordBatch为单位写入，每个Batch中至少有一个Record。下图是根据源码中描绘的log中RecordBatch的数据结构:
 
 <div align="center">
-<img src="/assets/img/2018/06/13/RecordStruct.jpeg" width="40%" height="40%"/>
+<img src="/assets/img/2018/06/13/RecordStruct.jpeg" width="30%" height="30%"/>
 </div>
 
 　　细心的话会留意到图中例如Record.length的类型为Varint，还有TimeStampDelta用的是Varlong。这是借鉴了Google Protocol Buffers的*zigzag*编码。有效的降低Batch的空间占用。当日志压缩开启时，会有后台线程定时进行日志压缩清理，用于减少日志的大小和提升系统速度。RecordBatch中的Record有可能会被压缩，而Header会保留未压缩的状态。
