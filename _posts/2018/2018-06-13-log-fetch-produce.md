@@ -222,7 +222,7 @@ TODO
         maxTimestampSoFar = largestTimestamp
         offsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp
       }
-      // append an entry to the index (if needed)
+
       //bytesSinceLastIndexEntry记录插入的数据的大小的累计，当累计超过indexIntervalBytes时，
       // 在offsetIndex中增加一条索引记录，以(largestOffset, physicalPosition)作为索引
       // 并清空累加值，同时尝试添加一条timeIndex记录，当maxTimestampSoFar, offsetOfMaxTimestamp都大于timeIndex中的最后一条记录对应的值
@@ -240,7 +240,7 @@ TODO
 
 ## <a id="Fetch">Fetch</a>
 
-　　为了研读从日志读取数据的源码，这里再一次地贴一下[Kafka Consumer(二)](https://daleizhou.github.io/posts/consume-messages.html)中贴过的ReplicaManager.readFromLocalLog()方法。当时未能结合日志具体实现来深入分析，这里结合新的内容重新讲解一遍。
+　　为了研读从日志读取数据的源码，这里再一次地贴一下[Kafka Consumer(二)](https://daleizhou.github.io/posts/consume-messages.html)中贴过的ReplicaManager.readFromLocalLog()方法。当时未能结合日志具体实现来深入分析，这里结合日志部分的内容重新讲解一遍。
 
 ```scala
   // ReplicaManager.scala
@@ -252,19 +252,18 @@ TODO
                        readPartitionInfo: Seq[(TopicPartition, PartitionData)],
                        quota: ReplicaQuota,
                        isolationLevel: IsolationLevel): Seq[(TopicPartition, LogReadResult)] = {
-
+    // 单个topicPartition分别调用一次read()方法
     def read(tp: TopicPartition, fetchInfo: PartitionData, limitBytes: Int, minOneMessage: Boolean): LogReadResult = {
+      // fetch开始的偏移量
       val offset = fetchInfo.fetchOffset
       val partitionFetchSize = fetchInfo.maxBytes
       val followerLogStartOffset = fetchInfo.logStartOffset
 
+      // 统计相关的
       brokerTopicStats.topicStats(tp.topic).totalFetchRequestRate.mark()
       brokerTopicStats.allTopicsStats.totalFetchRequestRate.mark()
 
       try {
-        trace(s"Fetching log segment for partition $tp, offset $offset, partition fetch size $partitionFetchSize, " +
-          s"remaining response limit $limitBytes" +
-          (if (minOneMessage) s", ignoring response/partition size limits" else ""))
 
         // decide whether to only fetch from leader
         val localReplica = if (fetchOnlyFromLeader)
@@ -272,7 +271,10 @@ TODO
         else
           getReplicaOrException(tp)
 
+        //当前messageOffset作为初始化的HW，因为messageOffset在读取过程中会发生变化，这里复制出来
         val initialHighWatermark = localReplica.highWatermark.messageOffset
+        // 根据隔离级别设定lastStableOffset变量
+        // 如果是READ_COMMITTED级别，则lastStableOffset设定为lastStableOffset.messageOffset，否则为None
         val lastStableOffset = if (isolationLevel == IsolationLevel.READ_COMMITTED)
           Some(localReplica.lastStableOffset.messageOffset)
         else
@@ -372,6 +374,74 @@ TODO
   }
 ```
 
+
+```scala
+  //Log.scala
+  def read(startOffset: Long, maxLength: Int, maxOffset: Option[Long] = None, minOneMessage: Boolean = false,
+           isolationLevel: IsolationLevel): FetchDataInfo = {
+    maybeHandleIOException(s"Exception while reading from $topicPartition in dir ${dir.getParent}") {
+      trace(s"Reading $maxLength bytes from offset $startOffset of length $size bytes")
+
+      // Because we don't use lock for reading, the synchronization is a little bit tricky.
+      // We create the local variables to avoid race conditions with updates to the log.
+      val currentNextOffsetMetadata = nextOffsetMetadata
+      val next = currentNextOffsetMetadata.messageOffset
+      if (startOffset == next) {
+        val abortedTransactions =
+          if (isolationLevel == IsolationLevel.READ_COMMITTED) Some(List.empty[AbortedTransaction])
+          else None
+        return FetchDataInfo(currentNextOffsetMetadata, MemoryRecords.EMPTY, firstEntryIncomplete = false,
+          abortedTransactions = abortedTransactions)
+      }
+
+      var segmentEntry = segments.floorEntry(startOffset)
+
+      // return error on attempt to read beyond the log end offset or read below log start offset
+      if (startOffset > next || segmentEntry == null || startOffset < logStartOffset)
+        throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
+          s"but we only have log segments in the range $logStartOffset to $next.")
+
+      // Do the read on the segment with a base offset less than the target offset
+      // but if that segment doesn't contain any messages with an offset greater than that
+      // continue to read from successive segments until we get some messages or we reach the end of the log
+      while (segmentEntry != null) {
+        val segment = segmentEntry.getValue
+
+        // If the fetch occurs on the active segment, there might be a race condition where two fetch requests occur after
+        // the message is appended but before the nextOffsetMetadata is updated. In that case the second fetch may
+        // cause OffsetOutOfRangeException. To solve that, we cap the reading up to exposed position instead of the log
+        // end of the active segment.
+        val maxPosition = {
+          if (segmentEntry == segments.lastEntry) {
+            val exposedPos = nextOffsetMetadata.relativePositionInSegment.toLong
+            // Check the segment again in case a new segment has just rolled out.
+            if (segmentEntry != segments.lastEntry)
+            // New log segment has rolled out, we can read up to the file end.
+              segment.size
+            else
+              exposedPos
+          } else {
+            segment.size
+          }
+        }
+        val fetchInfo = segment.read(startOffset, maxOffset, maxLength, maxPosition, minOneMessage)
+        if (fetchInfo == null) {
+          segmentEntry = segments.higherEntry(segmentEntry.getKey)
+        } else {
+          return isolationLevel match {
+            case IsolationLevel.READ_UNCOMMITTED => fetchInfo
+            case IsolationLevel.READ_COMMITTED => addAbortedTransactions(startOffset, segmentEntry, fetchInfo)
+          }
+        }
+      }
+
+      // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
+      // this can happen when all messages with offset larger than start offsets have been deleted.
+      // In this case, we will return the empty set with log end offset metadata
+      FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
+    }
+  }
+```
 ## TODO
 
 ## <a id="conclusion">总结</a>
@@ -380,6 +450,7 @@ TODO
 
 * https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Messagesets
 * http://code.google.com/apis/protocolbuffers/docs/encoding.html
+* http://matt33.com/2018/03/18/kafka-server-handle-produce-request/#%E6%97%A5%E5%BF%97%E5%86%99%E5%85%A5
 
 
 
