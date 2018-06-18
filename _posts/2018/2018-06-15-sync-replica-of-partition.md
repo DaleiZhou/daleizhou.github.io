@@ -170,7 +170,151 @@ UpdateMetadataRequest
 　　可以看到在Controller启动后，如果当选为Controller,则进行一些缓存的清理，并在zk上注册监听事件，监听那些Broker变化，Topic变化等事件，用于行使Controller的具体职责。并且通过发送UpdateMetadataRequest,用于各个Broker更新metadata。在启动过程中，Controller还会启动副本状态机和分区状态机。这两个状态机用于记录副本和分区的状态，并且预设了状态转换的处理方法。在Controller启动时会分别调用两个状态机的startup()方法，在该方法中初始化副本和分区的状态，并且主要地触发LeaderAndIsrRequest请求到Broker。
 
 ## <a id="KafkaApis">KafkaApis</a>
-UpdateMetadataRequest
+
+　　下面来看Broker接收到LeaderAndIsrRequest请求的处理过程。
+
+```scala
+  //KafkaApis.scala 
+  def handle(request: RequestChannel.Request) {
+        case ApiKeys.LEADER_AND_ISR => handleLeaderAndIsrRequest(request)
+  }
+
+  def handleLeaderAndIsrRequest(request: RequestChannel.Request) {
+    val correlationId = request.header.correlationId
+    val leaderAndIsrRequest = request.body[LeaderAndIsrRequest]
+
+    // 副本leadership变更回调方法
+    def onLeadershipChange(updatedLeaders: Iterable[Partition], updatedFollowers: Iterable[Partition]) {
+      // 如果topic为内部topic:GROUP_METADATA_TOPIC_NAME或TRANSACTION_STATE_TOPIC_NAME
+      // 通过groupCoordinator/txnCoordinator进行迁移工作
+      updatedLeaders.foreach { partition =>
+        if (partition.topic == GROUP_METADATA_TOPIC_NAME)
+          groupCoordinator.handleGroupImmigration(partition.partitionId)
+        else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME)
+          txnCoordinator.handleTxnImmigration(partition.partitionId, partition.getLeaderEpoch)
+      }
+
+      updatedFollowers.foreach { partition =>
+        if (partition.topic == GROUP_METADATA_TOPIC_NAME)
+          groupCoordinator.handleGroupEmigration(partition.partitionId)
+        else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME)
+          txnCoordinator.handleTxnEmigration(partition.partitionId, partition.getLeaderEpoch)
+      }
+    }
+
+    if (authorize(request.session, ClusterAction, Resource.ClusterResource)) {
+      // 调用replicaManager.becomeLeaderOrFollower()逐个对分区进行处理
+      val response = replicaManager.becomeLeaderOrFollower(correlationId, leaderAndIsrRequest, onLeadershipChange)
+      sendResponseExemptThrottle(request, response)
+    } else {
+      // 身份校验失败
+    }
+  }
+```
+
+```scala
+  // ReplicaManager.scala
+  def becomeLeaderOrFollower(correlationId: Int,
+                             leaderAndIsrRequest: LeaderAndIsrRequest,
+                             onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): LeaderAndIsrResponse = {
+
+    replicaStateChangeLock synchronized {
+      if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
+        // 请求中epoch过期，直接返回错误码
+      } else {
+        val responseMap = new mutable.HashMap[TopicPartition, Errors]
+        val controllerId = leaderAndIsrRequest.controllerId
+        controllerEpoch = leaderAndIsrRequest.controllerEpoch
+
+        // First check partition's leader epoch
+        val partitionState = new mutable.HashMap[Partition, LeaderAndIsrRequest.PartitionState]()
+        // 根据ReplicaManager的缓存过滤出之前未保存过的topicPartition
+        val newPartitions = leaderAndIsrRequest.partitionStates.asScala.keys.filter(topicPartition => getPartition(topicPartition).isEmpty)
+
+        // 对leaderAndIsrRequest请求中的tp逐个处理
+        leaderAndIsrRequest.partitionStates.asScala.foreach { case (topicPartition, stateInfo) =>
+          val partition = getOrCreatePartition(topicPartition)
+          val partitionLeaderEpoch = partition.getLeaderEpoch
+          if (partition eq ReplicaManager.OfflinePartition) {
+            // partition已经离线
+            responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
+          } else if (partitionLeaderEpoch < stateInfo.basePartitionState.leaderEpoch) {
+            if(stateInfo.basePartitionState.replicas.contains(localBrokerId))
+              // 合法的epoch，且本地brokerid在assigned列表中
+              partitionState.put(partition, stateInfo)
+            else {
+              // brokerId不在副本的assigned列表中
+              responseMap.put(topicPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+            }
+          } else {
+            // 其他情况，记录错误在返回结果集中
+            responseMap.put(topicPartition, Errors.STALE_CONTROLLER_EPOCH)
+          }
+        }
+
+        // partitionState经过上面的逐个校验，里面存放的都是通过检验的请求数据
+        //如果partition的leader与本地brokerId一致，说明该分区的leader为本机器上的副本
+        val partitionsTobeLeader = partitionState.filter { case (_, stateInfo) =>
+          stateInfo.basePartitionState.leader == localBrokerId
+        }
+        // 否则本地的副本为follower副本
+        val partitionsToBeFollower = partitionState -- partitionsTobeLeader.keys
+
+        // 如果那些标记本地broker为leader的tp列表partitionsTobeLeader不为空，则调用makeLeaders()方法进行一些副本leader的工作
+        val partitionsBecomeLeader = if (partitionsTobeLeader.nonEmpty)
+          // 使得本地副本为leader需要做：
+          // 1. 停止partition对应的fetch线程
+          // 2. 更新缓存中分区的metadata数据
+          // 3. 将该partition加入到partitionleader集合中
+          makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, correlationId, responseMap)
+        else
+          Set.empty[Partition]
+        //
+        val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty)
+          makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, correlationId, responseMap)
+        else
+          Set.empty[Partition]
+
+        leaderAndIsrRequest.partitionStates.asScala.keys.foreach(topicPartition =>
+          /*
+           * If there is offline log directory, a Partition object may have been created by getOrCreatePartition()
+           * before getOrCreateReplica() failed to create local replica due to KafkaStorageException.
+           * In this case ReplicaManager.allPartitions will map this topic-partition to an empty Partition object.
+           * we need to map this topic-partition to OfflinePartition instead.
+           */
+          if (getReplica(topicPartition).isEmpty && (allPartitions.get(topicPartition) ne ReplicaManager.OfflinePartition))
+            allPartitions.put(topicPartition, ReplicaManager.OfflinePartition)
+        )
+
+        // we initialize highwatermark thread after the first leaderisrrequest. This ensures that all the partitions
+        // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+        if (!hwThreadInitialized) {
+          startHighWaterMarksCheckPointThread()
+          hwThreadInitialized = true
+        }
+
+        val newOnlineReplicas = newPartitions.flatMap(topicPartition => getReplica(topicPartition))
+        // Add future replica to partition's map
+        val futureReplicasAndInitialOffset = newOnlineReplicas.filter { replica =>
+          logManager.getLog(replica.topicPartition, isFuture = true).isDefined
+        }.map { replica =>
+          replica.topicPartition -> BrokerAndInitialOffset(BrokerEndPoint(config.brokerId, "localhost", -1), replica.highWatermark.messageOffset)
+        }.toMap
+        futureReplicasAndInitialOffset.keys.foreach(tp => getPartition(tp).get.getOrCreateReplica(Request.FutureLocalReplicaId))
+
+        // pause cleaning for partitions that are being moved and start ReplicaAlterDirThread to move replica from source dir to destination dir
+        futureReplicasAndInitialOffset.keys.foreach(logManager.abortAndPauseCleaning)
+        replicaAlterLogDirsManager.addFetcherForPartitions(futureReplicasAndInitialOffset)
+
+        replicaFetcherManager.shutdownIdleFetcherThreads()
+        replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
+        onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
+        new LeaderAndIsrResponse(Errors.NONE, responseMap.asJava)
+      }
+    }
+  }
+
+```
 
 
 
