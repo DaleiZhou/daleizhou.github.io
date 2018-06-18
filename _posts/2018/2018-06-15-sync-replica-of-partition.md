@@ -422,7 +422,8 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
           partition.topicPartition -> BrokerAndInitialOffset(
             metadataCache.getAliveBrokers.find(_.id == partition.leaderReplicaIdOpt.get).get.brokerEndPoint(config.interBrokerListenerName),
             partition.getReplica().get.highWatermark.messageOffset)).toMap
-        // 为每个变更了leader的副本创建fetch线程并启动
+        // 
+
         replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
         }
       }
@@ -435,7 +436,52 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
   }
 ```
 
-　　在ReplicaManager.makeFollowers()方法调用了replicaFetcherManager.addFetcherForPartitions()为每个变更了leader的副本创建一个ReplicaFetcherThread后台线程并启动,用于副本的主从同步。
+　　在ReplicaManager.makeFollowers()方法调用了replicaFetcherManager.addFetcherForPartitions()方法进行后台同步线程的创建。为每个变更了leader的副本创建一个ReplicaFetcherThread后台线程并启动,用于副本的主从同步。
+
+```scala
+  // AbstractFetcherManager.scala
+  def addFetcherForPartitions(partitionAndOffsets: Map[TopicPartition, BrokerAndInitialOffset]) {
+    lock synchronized {
+      // 通过简单的hash运算获得FetcherId，并与broker组成key,将partitionAndOffsets进行group
+      val partitionsPerFetcher = partitionAndOffsets.groupBy { case(topicPartition, brokerAndInitialFetchOffset) =>
+        BrokerAndFetcherId(brokerAndInitialFetchOffset.broker, getFetcherId(topicPartition.topic, topicPartition.partition))}
+
+      def addAndStartFetcherThread(brokerAndFetcherId: BrokerAndFetcherId, brokerIdAndFetcherId: BrokerIdAndFetcherId) {
+        // 创建ReplicaFetcherThread线程并启动
+        val fetcherThread = createFetcherThread(brokerAndFetcherId.fetcherId, brokerAndFetcherId.broker)
+        fetcherThreadMap.put(brokerIdAndFetcherId, fetcherThread)
+        fetcherThread.start
+      }
+
+      for ((brokerAndFetcherId, initialFetchOffsets) <- partitionsPerFetcher) {
+        val brokerIdAndFetcherId = BrokerIdAndFetcherId(brokerAndFetcherId.broker.id, brokerAndFetcherId.fetcherId)
+        // 如果缓存中存在brokerIdAndFetcherId，且host,port都一致，则直接复用，
+        // 其他情况停止原来线程(如果有)，并且新建后台线程并启动
+        fetcherThreadMap.get(brokerIdAndFetcherId) match {
+          case Some(f) if f.sourceBroker.host == brokerAndFetcherId.broker.host && f.sourceBroker.port == brokerAndFetcherId.broker.port =>
+            // reuse the fetcher thread
+          case Some(f) =>
+            f.shutdown()
+            addAndStartFetcherThread(brokerAndFetcherId, brokerIdAndFetcherId)
+          case None =>
+            addAndStartFetcherThread(brokerAndFetcherId, brokerIdAndFetcherId)
+        }
+
+        // 调用addPartitions()方法进行对offset进行处理
+        fetcherThreadMap(brokerIdAndFetcherId).addPartitions(initialFetchOffsets.map { case (tp, brokerAndInitOffset) =>
+          tp -> brokerAndInitOffset.initOffset
+        })
+      }
+    }
+
+    // log code ...
+  }
+
+```
+
+　　特别地，AbstractFetcherThread.addPartitions()中，如果offset超过了范围，则需要调用ReplicaFetcherThread.handleOffsetOutOfRange()方法进行截断处理，并返回可以新的offsetToFetch。该方法中，如果leaderEndOffset<本地副本的offset,则截断本地副本日志。
+
+　　如果leaderEndOffset >= replica.logEndOffset.messageOffset。出现这种情况，可能是是follower宕机很久了，可能他的endOffset都小于leader的beginOffset，另一种情况是脏选举的发生。这种情况下可能出现数据不一致的情况，Kafka并未提供解决方案，与前面那种情况合并，Kafka处理的方案是发送ListOffsetRequest请求获取leader的beginOffset,在leaderStartOffset和本地副本logEndOffset取较大值作为fetch的起始。如果这种情况下将本地log都截断掉，设置leaderStartOffset为本地log的起始offset，等待同步线程拉取数据。
 
 ## <a id="ReplicaFetcherThread">ReplicaFetcherThread</a>
 
