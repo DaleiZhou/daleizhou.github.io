@@ -490,6 +490,7 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
 ```scala
   // AbstractFetcherThread.scala
   override def doWork() {
+    // 每次doWork()先调用maybeTruncate()方法，从leader获取epochandoffset，更新本地副本fetchOffset,是否截断等
     maybeTruncate()
     val fetchRequest = inLock(partitionMapLock) {
       val ResultWithPartitions(fetchRequest, partitionsWithError) = buildFetchRequest(states)
@@ -504,27 +505,144 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
       processFetchRequest(fetchRequest)
   }
 
-  def maybeTruncate(): Unit = {
-    val ResultWithPartitions(epochRequests, partitionsWithError) = inLock(partitionMapLock) { buildLeaderEpochRequest(states) }
-    handlePartitionsWithErrors(partitionsWithError)
+  private def processFetchRequest(fetchRequest: REQ) {
+    val partitionsWithError = mutable.Set[TopicPartition]()
+    var responseData: Seq[(TopicPartition, PD)] = Seq.empty
 
-    if (epochRequests.nonEmpty) {
-      val fetchedEpochs = fetchEpochsFromLeader(epochRequests)
-      //Ensure we hold a lock during truncation.
+    try {
+      trace(s"Sending fetch request $fetchRequest")
+      responseData = fetch(fetchRequest)
+    } catch {
+      case t: Throwable =>
+        if (isRunning) {
+          warn(s"Error in response for fetch request $fetchRequest", t)
+          inLock(partitionMapLock) {
+            partitionsWithError ++= partitionStates.partitionSet.asScala
+            // there is an error occurred while fetching partitions, sleep a while
+            // note that `ReplicaFetcherThread.handlePartitionsWithError` will also introduce the same delay for every
+            // partition with error effectively doubling the delay. It would be good to improve this.
+            partitionMapCond.await(fetchBackOffMs, TimeUnit.MILLISECONDS)
+          }
+        }
+    }
+    fetcherStats.requestRate.mark()
+
+    if (responseData.nonEmpty) {
+      // process fetched data
       inLock(partitionMapLock) {
-        //Check no leadership changes happened whilst we were unlocked, fetching epochs
-        val leaderEpochs = fetchedEpochs.filter { case (tp, _) => partitionStates.contains(tp) }
-        val ResultWithPartitions(fetchOffsets, partitionsWithError) = maybeTruncate(leaderEpochs)
-        handlePartitionsWithErrors(partitionsWithError)
-        updateFetchOffsetAndMaybeMarkTruncationComplete(fetchOffsets)
+
+        responseData.foreach { case (topicPartition, partitionData) =>
+          val topic = topicPartition.topic
+          val partitionId = topicPartition.partition
+          Option(partitionStates.stateValue(topicPartition)).foreach(currentPartitionFetchState =>
+            // It's possible that a partition is removed and re-added or truncated when there is a pending fetch request.
+            // In this case, we only want to process the fetch response if the partition state is ready for fetch and the current offset is the same as the offset requested.
+            if (fetchRequest.offset(topicPartition) == currentPartitionFetchState.fetchOffset &&
+                currentPartitionFetchState.isReadyForFetch) {
+              partitionData.error match {
+                case Errors.NONE =>
+                  try {
+                    val records = partitionData.toRecords
+                    val newOffset = records.batches.asScala.lastOption.map(_.nextOffset).getOrElse(
+                      currentPartitionFetchState.fetchOffset)
+
+                    fetcherLagStats.getAndMaybePut(topic, partitionId).lag = Math.max(0L, partitionData.highWatermark - newOffset)
+                    // Once we hand off the partition data to the subclass, we can't mess with it any more in this thread
+                    processPartitionData(topicPartition, currentPartitionFetchState.fetchOffset, partitionData)
+
+                    val validBytes = records.validBytes
+                    // ReplicaDirAlterThread may have removed topicPartition from the partitionStates after processing the partition data
+                    if (validBytes > 0 && partitionStates.contains(topicPartition)) {
+                      // Update partitionStates only if there is no exception during processPartitionData
+                      partitionStates.updateAndMoveToEnd(topicPartition, new PartitionFetchState(newOffset))
+                      fetcherStats.byteRate.mark(validBytes)
+                    }
+                  } catch {
+                    case ime: CorruptRecordException =>
+                      // we log the error and continue. This ensures two things
+                      // 1. If there is a corrupt message in a topic partition, it does not bring the fetcher thread down and cause other topic partition to also lag
+                      // 2. If the message is corrupt due to a transient state in the log (truncation, partial writes can cause this), we simply continue and
+                      // should get fixed in the subsequent fetches
+                      error(s"Found invalid messages during fetch for partition $topicPartition offset ${currentPartitionFetchState.fetchOffset}", ime)
+                      partitionsWithError += topicPartition
+                    case e: KafkaStorageException =>
+                      error(s"Error while processing data for partition $topicPartition", e)
+                      partitionsWithError += topicPartition
+                    case e: Throwable =>
+                      throw new KafkaException(s"Error processing data for partition $topicPartition " +
+                        s"offset ${currentPartitionFetchState.fetchOffset}", e)
+                  }
+                case Errors.OFFSET_OUT_OF_RANGE =>
+                  try {
+                    val newOffset = handleOffsetOutOfRange(topicPartition)
+                    partitionStates.updateAndMoveToEnd(topicPartition, new PartitionFetchState(newOffset))
+                    info(s"Current offset ${currentPartitionFetchState.fetchOffset} for partition $topicPartition is " +
+                      s"out of range, which typically implies a leader change. Reset fetch offset to $newOffset")
+                  } catch {
+                    case e: FatalExitError => throw e
+                    case e: Throwable =>
+                      error(s"Error getting offset for partition $topicPartition", e)
+                      partitionsWithError += topicPartition
+                  }
+
+                case Errors.NOT_LEADER_FOR_PARTITION =>
+                  info(s"Remote broker is not the leader for partition $topicPartition, which could indicate " +
+                    "that the partition is being moved")
+                  partitionsWithError += topicPartition
+
+                case _ =>
+                  error(s"Error for partition $topicPartition at offset ${currentPartitionFetchState.fetchOffset}",
+                    partitionData.exception.get)
+                  partitionsWithError += topicPartition
+              }
+            })
+        }
       }
+    }
+
+    if (partitionsWithError.nonEmpty) {
+      debug(s"Handling errors for partitions $partitionsWithError")
+      handlePartitionsWithErrors(partitionsWithError)
     }
   }
 ```
 
+```scala
+  // ReplicaFetcherThread.scala
+  override def buildFetchRequest(partitionMap: Seq[(TopicPartition, PartitionFetchState)]): ResultWithPartitions[FetchRequest] = {
+    val partitionsWithError = mutable.Set[TopicPartition]()
+
+    val builder = fetchSessionHandler.newBuilder()
+    partitionMap.foreach { case (topicPartition, partitionFetchState) =>
+      // We will not include a replica in the fetch request if it should be throttled.
+      if (partitionFetchState.isReadyForFetch && !shouldFollowerThrottle(quota, topicPartition)) {
+        try {
+          val logStartOffset = replicaMgr.getReplicaOrException(topicPartition).logStartOffset
+          builder.add(topicPartition, new JFetchRequest.PartitionData(
+            partitionFetchState.fetchOffset, logStartOffset, fetchSize))
+        } catch {
+          case _: KafkaStorageException =>
+            // The replica has already been marked offline due to log directory failure and the original failure should have already been logged.
+            // This partition should be removed from ReplicaFetcherThread soon by ReplicaManager.handleLogDirFailure()
+            partitionsWithError += topicPartition
+        }
+      }
+    }
+
+    val fetchData = builder.build()
+    val requestBuilder = JFetchRequest.Builder.
+      forReplica(fetchRequestVersion, replicaId, maxWait, minBytes, fetchData.toSend())
+        .setMaxBytes(maxBytes)
+        .toForget(fetchData.toForget)
+    if (fetchMetadataSupported) {
+      requestBuilder.metadata(fetchData.metadata())
+    }
+    ResultWithPartitions(new FetchRequest(fetchData.sessionPartitions(), requestBuilder), partitionsWithError)
+  }
+```
 
 
-
+##TODO: daleizhou
 
 
 
