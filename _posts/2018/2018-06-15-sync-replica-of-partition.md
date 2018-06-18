@@ -212,6 +212,8 @@ UpdateMetadataRequest
   }
 ```
 
+　　handleLeaderAndIsrRequest()方法中在验证身份通过情况下，调用replicaManager.becomeLeaderOrFollower()方法处理请求，该方法针对本broker是否是某partition的leader分别做不同操作，具体实现如下:
+
 ```scala
   // ReplicaManager.scala
   def becomeLeaderOrFollower(correlationId: Int,
@@ -431,12 +433,49 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
 
     partitionsToMakeFollower
   }
-
 ```
 
-## <a id="ReplicaFetcherManager">ReplicaFetcherManager</a>
+　　在ReplicaManager.makeFollowers()方法调用了replicaFetcherManager.addFetcherForPartitions()为每个变更了leader的副本创建一个ReplicaFetcherThread后台线程并启动,用于副本的主从同步。
 
-　　至此，正式引入我们这篇博文的主题: Fetch线程。在ReplicaManager.makeFollowers()方法调用了replicaFetcherManager.addFetcherForPartitions()为每个变更了leader的副本创建一个同步的后台线程并启动。
+## <a id="ReplicaFetcherThread">ReplicaFetcherThread</a>
+
+　　至此，正式引入我们这篇博文的主题: ReplicaFetcherThread。该线程继承自AbstractFetcherThread，而AbstractFetcherThread又继承自ShutdownableThread。在ShutdownableThread的run()方法中可以看到后台线程是一直循环调用doWork()进行发送fetch请求并处理结果。我们直接看AbstractFetcherThread的doWork()方法。
+
+```scala
+  // AbstractFetcherThread.scala
+  override def doWork() {
+    maybeTruncate()
+    val fetchRequest = inLock(partitionMapLock) {
+      val ResultWithPartitions(fetchRequest, partitionsWithError) = buildFetchRequest(states)
+      if (fetchRequest.isEmpty) {
+        // log code ...
+        partitionMapCond.await(fetchBackOffMs, TimeUnit.MILLISECONDS)
+      }
+      handlePartitionsWithErrors(partitionsWithError)
+      fetchRequest
+    }
+    if (!fetchRequest.isEmpty)
+      processFetchRequest(fetchRequest)
+  }
+
+  def maybeTruncate(): Unit = {
+    val ResultWithPartitions(epochRequests, partitionsWithError) = inLock(partitionMapLock) { buildLeaderEpochRequest(states) }
+    handlePartitionsWithErrors(partitionsWithError)
+
+    if (epochRequests.nonEmpty) {
+      val fetchedEpochs = fetchEpochsFromLeader(epochRequests)
+      //Ensure we hold a lock during truncation.
+      inLock(partitionMapLock) {
+        //Check no leadership changes happened whilst we were unlocked, fetching epochs
+        val leaderEpochs = fetchedEpochs.filter { case (tp, _) => partitionStates.contains(tp) }
+        val ResultWithPartitions(fetchOffsets, partitionsWithError) = maybeTruncate(leaderEpochs)
+        handlePartitionsWithErrors(partitionsWithError)
+        updateFetchOffsetAndMaybeMarkTruncationComplete(fetchOffsets)
+      }
+    }
+  }
+```
+
 
 
 
