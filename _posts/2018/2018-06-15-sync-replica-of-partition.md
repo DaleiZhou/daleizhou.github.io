@@ -372,12 +372,7 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
                             partitionStates: Map[Partition, LeaderAndIsrRequest.PartitionState],
                             correlationId: Int,
                             responseMap: mutable.Map[TopicPartition, Errors]) : Set[Partition] = {
-    partitionStates.foreach { case (partition, partitionState) =>
-      stateChangeLogger.trace(s"Handling LeaderAndIsr request correlationId $correlationId from controller $controllerId " +
-        s"epoch $epoch starting the become-follower transition for partition ${partition.topicPartition} with leader " +
-        s"${partitionState.basePartitionState.leader}")
-    }
-
+    // other code ...
     for (partition <- partitionStates.keys)
       responseMap.put(partition.topicPartition, Errors.NONE)
 
@@ -388,94 +383,50 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
       partitionStates.foreach { case (partition, partitionStateInfo) =>
         val newLeaderBrokerId = partitionStateInfo.basePartitionState.leader
         try {
-          metadataCache.getAliveBrokers.find(_.id == newLeaderBrokerId) match { //leader是否可用
-            // Only change partition state when the leader is available
+          metadataCache.getAliveBrokers.find(_.id == newLeaderBrokerId) match  
+            //当且仅当leader是否可用时变更副本状态
             case Some(_) =>
+              // 当副本leader可用时，通过partition.makeFollower()方法进行设置leader，清空isr的工作
+              // 如果缓存中的leaderReplicaIdOpt与本次发送过来请求中一致，则makeFollower返回false，否则更新leaderReplicaIdOpt并返回true
               if (partition.makeFollower(controllerId, partitionStateInfo, correlationId))
                 partitionsToMakeFollower += partition
               else
-                stateChangeLogger.info(s"Skipped the become-follower state change after marking its partition as " +
-                  s"follower with correlation id $correlationId from controller $controllerId epoch $epoch " +
-                  s"for partition ${partition.topicPartition} (last update " +
-                  s"controller epoch ${partitionStateInfo.basePartitionState.controllerEpoch}) " +
-                  s"since the new leader $newLeaderBrokerId is the same as the old leader")
+                // 旧的leader和新的leader一致
             case None =>
-              // The leader broker should always be present in the metadata cache.
-              // If not, we should record the error message and abort the transition process for this partition
-              stateChangeLogger.error(s"Received LeaderAndIsrRequest with correlation id $correlationId from " +
-                s"controller $controllerId epoch $epoch for partition ${partition.topicPartition} " +
-                s"(last update controller epoch ${partitionStateInfo.basePartitionState.controllerEpoch}) " +
-                s"but cannot become follower since the new leader $newLeaderBrokerId is unavailable.")
-              // Create the local replica even if the leader is unavailable. This is required to ensure that we include
-              // the partition's high watermark in the checkpoint file (see KAFKA-1647)
+              // 即便leader不可用，但是任然创建本地副本，保证本地副本的watermark存在于checkpoint文件中
               partition.getOrCreateReplica(isNew = partitionStateInfo.isNew)
           }
         } catch {
-          case e: KafkaStorageException =>
-            stateChangeLogger.error(s"Skipped the become-follower state change with correlation id $correlationId from " +
-              s"controller $controllerId epoch $epoch for partition ${partition.topicPartition} " +
-              s"(last update controller epoch ${partitionStateInfo.basePartitionState.controllerEpoch}) with leader " +
-              s"$newLeaderBrokerId since the replica for the partition is offline due to disk error $e")
-            val dirOpt = getLogDir(partition.topicPartition)
-            error(s"Error while making broker the follower for partition $partition with leader " +
-              s"$newLeaderBrokerId in dir $dirOpt", e)
-            responseMap.put(partition.topicPartition, Errors.KAFKA_STORAGE_ERROR)
+          // handle exception code ...
         }
       }
 
+      // 通过replicaFetcherManager将那些leader有变化的副本的同步线程移除，后面会重新添加对应的同步线程
       replicaFetcherManager.removeFetcherForPartitions(partitionsToMakeFollower.map(_.topicPartition))
-      partitionsToMakeFollower.foreach { partition =>
-        stateChangeLogger.trace(s"Stopped fetchers as part of become-follower request from controller $controllerId " +
-          s"epoch $epoch with correlation id $correlationId for partition ${partition.topicPartition} with leader " +
-          s"${partitionStates(partition).basePartitionState.leader}")
-      }
-
+      // 
       partitionsToMakeFollower.foreach { partition =>
         val topicPartitionOperationKey = new TopicPartitionOperationKey(partition.topicPartition)
+        // 将为延迟完成的Produce， Fetch工作做完
         tryCompleteDelayedProduce(topicPartitionOperationKey)
         tryCompleteDelayedFetch(topicPartitionOperationKey)
       }
 
-      partitionsToMakeFollower.foreach { partition =>
-        stateChangeLogger.trace(s"Truncated logs and checkpointed recovery boundaries for partition " +
-          s"${partition.topicPartition} as part of become-follower request with correlation id $correlationId from " +
-          s"controller $controllerId epoch $epoch with leader ${partitionStates(partition).basePartitionState.leader}")
-      }
-
       if (isShuttingDown.get()) {
-        partitionsToMakeFollower.foreach { partition =>
-          stateChangeLogger.trace(s"Skipped the adding-fetcher step of the become-follower state " +
-            s"change with correlation id $correlationId from controller $controllerId epoch $epoch for " +
-            s"partition ${partition.topicPartition} with leader ${partitionStates(partition).basePartitionState.leader} " +
-            "since it is shutting down")
-        }
+        // 如果isShuttingDown，则跳过添加后台同步线程
       }
       else {
-        // we do not need to check if the leader exists again since this has been done at the beginning of this process
+        // 从缓存中读取leader的endpoint及本replica的hiehwatermark的offset
         val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map(partition =>
           partition.topicPartition -> BrokerAndInitialOffset(
             metadataCache.getAliveBrokers.find(_.id == partition.leaderReplicaIdOpt.get).get.brokerEndPoint(config.interBrokerListenerName),
             partition.getReplica().get.highWatermark.messageOffset)).toMap
+        // 为每个变更了leader的副本创建fetch线程并启动
         replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
-
-        partitionsToMakeFollower.foreach { partition =>
-          stateChangeLogger.trace(s"Started fetcher to new leader as part of become-follower " +
-            s"request from controller $controllerId epoch $epoch with correlation id $correlationId for " +
-            s"partition ${partition.topicPartition} with leader ${partitionStates(partition).basePartitionState.leader}")
         }
       }
     } catch {
-      case e: Throwable =>
-        stateChangeLogger.error(s"Error while processing LeaderAndIsr request with correlationId $correlationId " +
-          s"received from controller $controllerId epoch $epoch", e)
-        // Re-throw the exception for it to be caught in KafkaApis
-        throw e
+      // handle exception code ...
     }
-
-    partitionStates.keys.foreach { partition =>
-      stateChangeLogger.trace(s"Completed LeaderAndIsr request correlationId $correlationId from controller $controllerId " +
-        s"epoch $epoch for the become-follower transition for partition ${partition.topicPartition} with leader " +
-        s"${partitionStates(partition).basePartitionState.leader}")
     }
 
     partitionsToMakeFollower
@@ -483,7 +434,9 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
 
 ```
 
-至此，正式引入我们这篇博文的主题: Fetch线程。
+## <a id="ReplicaFetcherManager">ReplicaFetcherManager</a>
+
+　　至此，正式引入我们这篇博文的主题: Fetch线程。在ReplicaManager.makeFollowers()方法调用了replicaFetcherManager.addFetcherForPartitions()为每个变更了leader的副本创建一个同步的后台线程并启动。
 
 
 
