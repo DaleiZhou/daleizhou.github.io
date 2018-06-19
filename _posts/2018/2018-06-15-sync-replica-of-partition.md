@@ -602,9 +602,6 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
     // 在本地副本的logEndOffset.messageOffset和返回结果partitionData.highWatermark中取较小值作为followerHighWatermark，来更新副本内存缓存的highWatermark
     val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.highWatermark)
     val leaderLogStartOffset = partitionData.logStartOffset
-    // for the follower replica, we do not need to keep
-    // its segment base offset the physical position,
-    // these values will be computed upon making the leader
     replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
     // 如果leaderlogStartOffset<本地highWatermark.messageOffset,且newLogStartOffset > logStartOffset，
     // 则更新本地的log start offset
