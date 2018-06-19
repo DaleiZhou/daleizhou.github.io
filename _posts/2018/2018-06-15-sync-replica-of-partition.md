@@ -538,13 +538,13 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
                       currentPartitionFetchState.fetchOffset)
 
                     fetcherLagStats.getAndMaybePut(topic, partitionId).lag = Math.max(0L, partitionData.highWatermark - newOffset)
-                    // Once we hand off the partition data to the subclass, we can't mess with it any more in this thread
+                    // 调用子类实现的processPartitionData()方法处理返回结果
                     processPartitionData(topicPartition, currentPartitionFetchState.fetchOffset, partitionData)
 
                     val validBytes = records.validBytes
-                    // ReplicaDirAlterThread may have removed topicPartition from the partitionStates after processing the partition data
+                    // 如果validBytes>0 ,且后台线程没有将tp从partitionStates移除
                     if (validBytes > 0 && partitionStates.contains(topicPartition)) {
-                      // Update partitionStates only if there is no exception during processPartitionData
+                      // 更新tp的分区状态信息
                       partitionStates.updateAndMoveToEnd(topicPartition, new PartitionFetchState(newOffset))
                       fetcherStats.byteRate.mark(validBytes)
                     }
@@ -575,7 +575,7 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
   }
 ```
 
-　　processFetchRequest()方法在处理正常结果情况下会调用ReplicaFetcherThread.processPartitionData()对fetch回的结果进行处理。
+　　副本主从同步过程中，processFetchRequest()方法在处理正常结果情况下会调用ReplicaFetcherThread.processPartitionData()对fetch回的结果进行处理。
 
 ```scala
   // ReplicaFetcherThread.scala
@@ -586,29 +586,29 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
 
     maybeWarnIfOversizedRecords(records, topicPartition)
 
+    // 确保开始fetchOffset与现有分区log的endOffset一致才写入数据
     if (fetchOffset != replica.logEndOffset.messageOffset)
       throw new IllegalStateException("Offset mismatch for partition %s: fetched offset = %d, log end offset = %d.".format(
         topicPartition, fetchOffset, replica.logEndOffset.messageOffset))
 
-    if (isTraceEnabled)
-      trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
-        .format(replica.logEndOffset.messageOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
+    // trace log code ...
 
     // Append the leader's messages to the log
+    // 作为follower将leader的同步结果append到本地副本log中，append()的细节在前一篇介绍log读写的分析博文中有具体介绍，这里不再展开
     partition.appendRecordsToFollower(records)
 
-    if (isTraceEnabled)
-      trace("Follower has replica log end offset %d after appending %d bytes of messages for partition %s"
-        .format(replica.logEndOffset.messageOffset, records.sizeInBytes, topicPartition))
+    // trace log code ...
+
+    // 在本地副本的logEndOffset.messageOffset和返回结果partitionData.highWatermark中取较小值作为followerHighWatermark，来更新副本内存缓存的highWatermark
     val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.highWatermark)
     val leaderLogStartOffset = partitionData.logStartOffset
     // for the follower replica, we do not need to keep
     // its segment base offset the physical position,
     // these values will be computed upon making the leader
     replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
+    // 如果leaderlogStartOffset<本地highWatermark.messageOffset,且newLogStartOffset > logStartOffset，
+    // 则更新本地的log start offset
     replica.maybeIncrementLogStartOffset(leaderLogStartOffset)
-    if (isTraceEnabled)
-      trace(s"Follower set replica high watermark for partition $topicPartition to $followerHighWatermark")
     if (quota.isThrottled(topicPartition))
       quota.record(records.sizeInBytes)
     replicaMgr.brokerTopicStats.updateReplicationBytesIn(records.sizeInBytes)
