@@ -141,7 +141,6 @@ title: Kafka 副本间的主从同步
     
     // 获取被删除的topics    
     val (topicsToBeDeleted, topicsIneligibleForDeletion) = fetchTopicDeletionsInProgress()
-    //info("Initializing topic deletion manager")
     //初始化通过topicDeletionManager，如果isDeleteTopicEnabled则在zk中直接删除topicsToBeDeleted
     topicDeletionManager.init(topicsToBeDeleted, topicsIneligibleForDeletion)
 
@@ -493,6 +492,7 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
     // 每次doWork()先调用maybeTruncate()方法，从leader获取epochandoffset，更新本地副本fetchOffset,是否截断等
     maybeTruncate()
     val fetchRequest = inLock(partitionMapLock) {
+      // 通过ReplicaFetcherThread.buildFetchRequest()方法构造fetchrequest,在请求中，对每个tp逐个设置拉取的offset,startoffset，fetchsize等，最终形成一个整个的请求
       val ResultWithPartitions(fetchRequest, partitionsWithError) = buildFetchRequest(states)
       if (fetchRequest.isEmpty) {
         // log code ...
@@ -501,6 +501,7 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
       handlePartitionsWithErrors(partitionsWithError)
       fetchRequest
     }
+    // 如果构建的请求不为empty,则调用processFetchRequest()处理请求
     if (!fetchRequest.isEmpty)
       processFetchRequest(fetchRequest)
   }
@@ -510,33 +511,23 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
     var responseData: Seq[(TopicPartition, PD)] = Seq.empty
 
     try {
-      trace(s"Sending fetch request $fetchRequest")
+      // 发送请求并阻塞直到结果返回
       responseData = fetch(fetchRequest)
     } catch {
       case t: Throwable =>
-        if (isRunning) {
-          warn(s"Error in response for fetch request $fetchRequest", t)
-          inLock(partitionMapLock) {
-            partitionsWithError ++= partitionStates.partitionSet.asScala
-            // there is an error occurred while fetching partitions, sleep a while
-            // note that `ReplicaFetcherThread.handlePartitionsWithError` will also introduce the same delay for every
-            // partition with error effectively doubling the delay. It would be good to improve this.
-            partitionMapCond.await(fetchBackOffMs, TimeUnit.MILLISECONDS)
-          }
-        }
+        // 异常处理，发生异常则等待一段时间
     }
     fetcherStats.requestRate.mark()
 
     if (responseData.nonEmpty) {
       // process fetched data
       inLock(partitionMapLock) {
-
+        // 返回结果不为空，则逐个tp进行结果处理
         responseData.foreach { case (topicPartition, partitionData) =>
           val topic = topicPartition.topic
           val partitionId = topicPartition.partition
           Option(partitionStates.stateValue(topicPartition)).foreach(currentPartitionFetchState =>
-            // It's possible that a partition is removed and re-added or truncated when there is a pending fetch request.
-            // In this case, we only want to process the fetch response if the partition state is ready for fetch and the current offset is the same as the offset requested.
+            // 结果返回期间可能发生了日志阶段或者分区被删除重加等操作，因此这里只对offset与请求offset一致，并且PartitionFetchState的状态为isReadyForFetch的情况下进行处理
             if (fetchRequest.offset(topicPartition) == currentPartitionFetchState.fetchOffset &&
                 currentPartitionFetchState.isReadyForFetch) {
               partitionData.error match {
@@ -558,48 +549,25 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
                       fetcherStats.byteRate.mark(validBytes)
                     }
                   } catch {
-                    case ime: CorruptRecordException =>
-                      // we log the error and continue. This ensures two things
-                      // 1. If there is a corrupt message in a topic partition, it does not bring the fetcher thread down and cause other topic partition to also lag
-                      // 2. If the message is corrupt due to a transient state in the log (truncation, partial writes can cause this), we simply continue and
-                      // should get fixed in the subsequent fetches
-                      error(s"Found invalid messages during fetch for partition $topicPartition offset ${currentPartitionFetchState.fetchOffset}", ime)
-                      partitionsWithError += topicPartition
-                    case e: KafkaStorageException =>
-                      error(s"Error while processing data for partition $topicPartition", e)
-                      partitionsWithError += topicPartition
-                    case e: Throwable =>
-                      throw new KafkaException(s"Error processing data for partition $topicPartition " +
-                        s"offset ${currentPartitionFetchState.fetchOffset}", e)
+                    // 异常处理
                   }
                 case Errors.OFFSET_OUT_OF_RANGE =>
                   try {
+                    // 如果为OFFSET_OUT_OF_RANGE异常，则根据返回结果进行日志截断，截断过程和AbstractFetcherThread.addPartitions()处理规程一致
                     val newOffset = handleOffsetOutOfRange(topicPartition)
+                    // 更新offset缓存
                     partitionStates.updateAndMoveToEnd(topicPartition, new PartitionFetchState(newOffset))
-                    info(s"Current offset ${currentPartitionFetchState.fetchOffset} for partition $topicPartition is " +
-                      s"out of range, which typically implies a leader change. Reset fetch offset to $newOffset")
                   } catch {
-                    case e: FatalExitError => throw e
-                    case e: Throwable =>
-                      error(s"Error getting offset for partition $topicPartition", e)
-                      partitionsWithError += topicPartition
+                    // exception handle code ...
                   }
-
-                case Errors.NOT_LEADER_FOR_PARTITION =>
-                  info(s"Remote broker is not the leader for partition $topicPartition, which could indicate " +
-                    "that the partition is being moved")
-                  partitionsWithError += topicPartition
-
-                case _ =>
-                  error(s"Error for partition $topicPartition at offset ${currentPartitionFetchState.fetchOffset}",
-                    partitionData.exception.get)
-                  partitionsWithError += topicPartition
+                // exception handle code ...
               }
             })
         }
       }
     }
 
+    // 错误处理
     if (partitionsWithError.nonEmpty) {
       debug(s"Handling errors for partitions $partitionsWithError")
       handlePartitionsWithErrors(partitionsWithError)
@@ -607,45 +575,49 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
   }
 ```
 
+　　processFetchRequest()方法在处理正常结果情况下会调用ReplicaFetcherThread.processPartitionData()对fetch回的结果进行处理。
+
 ```scala
   // ReplicaFetcherThread.scala
-  override def buildFetchRequest(partitionMap: Seq[(TopicPartition, PartitionFetchState)]): ResultWithPartitions[FetchRequest] = {
-    val partitionsWithError = mutable.Set[TopicPartition]()
+  def processPartitionData(topicPartition: TopicPartition, fetchOffset: Long, partitionData: PartitionData) {
+    val replica = replicaMgr.getReplicaOrException(topicPartition)
+    val partition = replicaMgr.getPartition(topicPartition).get
+    val records = partitionData.toRecords
 
-    val builder = fetchSessionHandler.newBuilder()
-    partitionMap.foreach { case (topicPartition, partitionFetchState) =>
-      // We will not include a replica in the fetch request if it should be throttled.
-      if (partitionFetchState.isReadyForFetch && !shouldFollowerThrottle(quota, topicPartition)) {
-        try {
-          val logStartOffset = replicaMgr.getReplicaOrException(topicPartition).logStartOffset
-          builder.add(topicPartition, new JFetchRequest.PartitionData(
-            partitionFetchState.fetchOffset, logStartOffset, fetchSize))
-        } catch {
-          case _: KafkaStorageException =>
-            // The replica has already been marked offline due to log directory failure and the original failure should have already been logged.
-            // This partition should be removed from ReplicaFetcherThread soon by ReplicaManager.handleLogDirFailure()
-            partitionsWithError += topicPartition
-        }
-      }
-    }
+    maybeWarnIfOversizedRecords(records, topicPartition)
 
-    val fetchData = builder.build()
-    val requestBuilder = JFetchRequest.Builder.
-      forReplica(fetchRequestVersion, replicaId, maxWait, minBytes, fetchData.toSend())
-        .setMaxBytes(maxBytes)
-        .toForget(fetchData.toForget)
-    if (fetchMetadataSupported) {
-      requestBuilder.metadata(fetchData.metadata())
-    }
-    ResultWithPartitions(new FetchRequest(fetchData.sessionPartitions(), requestBuilder), partitionsWithError)
+    if (fetchOffset != replica.logEndOffset.messageOffset)
+      throw new IllegalStateException("Offset mismatch for partition %s: fetched offset = %d, log end offset = %d.".format(
+        topicPartition, fetchOffset, replica.logEndOffset.messageOffset))
+
+    if (isTraceEnabled)
+      trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
+        .format(replica.logEndOffset.messageOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
+
+    // Append the leader's messages to the log
+    partition.appendRecordsToFollower(records)
+
+    if (isTraceEnabled)
+      trace("Follower has replica log end offset %d after appending %d bytes of messages for partition %s"
+        .format(replica.logEndOffset.messageOffset, records.sizeInBytes, topicPartition))
+    val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.highWatermark)
+    val leaderLogStartOffset = partitionData.logStartOffset
+    // for the follower replica, we do not need to keep
+    // its segment base offset the physical position,
+    // these values will be computed upon making the leader
+    replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
+    replica.maybeIncrementLogStartOffset(leaderLogStartOffset)
+    if (isTraceEnabled)
+      trace(s"Follower set replica high watermark for partition $topicPartition to $followerHighWatermark")
+    if (quota.isThrottled(topicPartition))
+      quota.record(records.sizeInBytes)
+    replicaMgr.brokerTopicStats.updateReplicationBytesIn(records.sizeInBytes)
   }
 ```
 
+## <a id="conclusion">总结</a>
 
-## TODO: daleizhou
+　　本文从KafkaServer的启动切入，介绍了集群在启动时全局会选举一个Controller，负责Topic创建删除，副本选举，副本重新分配等事件的处理。在启动后向各个Broker发送各自所有的分区对应的LeaderAndIsrRequest。各个Broker对所拥有的副本做处理。特别地，如果本地副本角色为follower,则开启同步线程定期从leader中拉取数据进行，并修改本地offset等缓存。
 
-
-
-
-
+　　至此，从controller到同步线程的拉取数据同步循环就介绍完毕了。
 
