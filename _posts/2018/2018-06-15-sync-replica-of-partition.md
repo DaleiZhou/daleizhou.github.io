@@ -10,7 +10,7 @@ title: Kafka 副本间的主从同步
   代码版本: 2.0.0-SNAPSHOT
 
 
-　　在深入到副本间的同步的内容是，先来看一下副本间同步的任务是如何从Kafka服务端启动后是如何开始的。KafkaServer启动时，主要调用KafkaServer.startup()方法进行初始化和启动，在startup()方法中初始化KafkaController并启动它。
+　　在深入到副本间的同步的内容前，先来看一下副本间同步的任务是如何从Kafka服务端启动后是如何开始的。KafkaServer启动时，主要调用KafkaServer.startup()方法进行初始化和启动，在startup()方法中初始化KafkaController并启动它。
 
 ## <a id="KafkaController">KafkaController</a>
 
