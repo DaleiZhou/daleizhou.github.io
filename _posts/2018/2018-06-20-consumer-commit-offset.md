@@ -11,12 +11,16 @@ title: Kafka Consumer(三)
 
   代码版本: 2.0.0-SNAPSHOT
 
-　　在[Kafka Consumer(一)](https://daleizhou.github.io/posts/consumer-subscribe.html)中介绍到通过KafkaConsumer.pollOnce()获取结果前会调用coordinator.poll()方法，在该方法中完成Coordinator,加入group等操作，该方法在最后还会调用maybeAutoCommitOffsetsAsync()来决定是否异步提交offset。本篇博文就从该方法讲起，追踪一下Offset的提交过程，算是对*Kafka Consumer*的补全。
+　　在[Kafka Consumer(一)](https://daleizhou.github.io/posts/consumer-subscribe.html)中介绍到通过KafkaConsumer.pollOnce()获取结果前会调用coordinator.poll()方法，在该方法中完成Coordinator,加入group等操作，该方法在最后还会调用maybeAutoCommitOffsetsAsync()来决定是否异步提交offset。本篇博文就从该方法讲起，追踪一下Offset的提交过程，算是对*Kafka Consumer*系列的补全。
 
 我们带着如下问题去看这部分的代码：
 1. 什么时候提交offset
 2. 服务端将处理过程
 3. 客户端收到返回之后如何进行处理
+
+## <a id="maybeAutoCommitOffsetsAsync">maybeAutoCommitOffsetsAsync</a>
+
+　　当KafkaConsumer启动设置了自动提交offset,maybeAutoCommitOffsetsAsyncKafka()方法才会真正起作用。当然如果用户有特殊需求，自己管理offset的提交也是可行的，Kafka同样提供了自行提交的调用方法。
 
 ```java
     //ConsumerCoordinator.java
@@ -48,7 +52,6 @@ title: Kafka Consumer(三)
         });
     }
 
-    // 
     public void commitOffsetsAsync(final Map<TopicPartition, OffsetAndMetadata> offsets, final OffsetCommitCallback callback) {
         invokeCompletedOffsetCommitCallbacks();
 
@@ -56,13 +59,6 @@ title: Kafka Consumer(三)
         if (!coordinatorUnknown()) {
             doCommitOffsetsAsync(offsets, callback);
         } else {
-            // we don't know the current coordinator, so try to find it and then send the commit
-            // or fail (we don't want recursive retries which can cause offset commits to arrive
-            // out of order). Note that there may be multiple offset commits chained to the same
-            // coordinator lookup request. This is fine because the listeners will be invoked in
-            // the same order that they were added. Note also that AbstractCoordinator prevents
-            // multiple concurrent coordinator lookup requests.
-
             // 如果coordinator未知，则通过lookupCoordinator()进行查找，
             // 并设置Listerner,用于coordinator正确查找到之后进行补发提交offset
             // 如果查找失败，则放入completedOffsetCommits中，设置RetriableCommitFailedException异常等待重试
@@ -156,9 +152,11 @@ title: Kafka Consumer(三)
     }
 ```
 
+　　提交Offset的流程中，Consumer端做的工作比较简单，我们主要看kafkaApis处理OffsetCommit的具体流程。
+
 ## <a id="handleOffsetCommitRequest">handleOffsetCommitRequest</a>
 
-　　提交Offset的流程中，Consumer端做的工作比较简单，我们主要看kafkaApis处理OffsetCommit的具体流程。
+　　与其它指令处理入口一样，OffsetCommit请求的处理入口也是KafkaApis.handle()方法。
 
 ```scala
   //KafkaApis.scala 
@@ -177,6 +175,7 @@ title: Kafka Consumer(三)
       val results = offsetCommitRequest.offsetData.keySet.asScala.map { topicPartition =>
         (topicPartition, error)
       }.toMap
+      // 逐个设置error后返回给客户端结果
       sendResponseMaybeThrottle(request, requestThrottleMs => new OffsetCommitResponse(requestThrottleMs, results.asJava))
     } else {
       val unauthorizedTopicErrors = mutable.Map[TopicPartition, Errors]()
@@ -277,10 +276,10 @@ title: Kafka Consumer(三)
   }
 ```
 
-　　// TODO
+　　groupCoordinator.handleCommitOffsets
 
 ```scala
-  //groupCoordinator.scala
+  //GroupCoordinator.scala
   def handleCommitOffsets(groupId: String,
                           memberId: String,
                           generationId: Int,
@@ -328,6 +327,9 @@ title: Kafka Consumer(三)
     }
   }
 
+```
+```scala
+  //GroupCoordinator.scala
   def storeOffsets(group: GroupMetadata,
                    consumerId: String,
                    offsetMetadata: immutable.Map[TopicPartition, OffsetAndMetadata],
@@ -343,7 +345,7 @@ title: Kafka Consumer(三)
       // 当JoinGroup时GroupMeta.initNextGeneration()初始化，将receivedConsumerOffsetCommits， 
       // receivedTransactionalOffsetCommits都设置为false 条件不成立,不会warn
       // 而当 group接受两种类型的offset提交混用时，可能会产生异常，给一个warn提示
-      // 可能kafka的作者不建议混用
+      // 可能Kafka的作者不建议混用
       if (!group.hasReceivedConsistentOffsetCommits)
         warn(s"group: ${group.groupId} with leader: ${group.leaderOrNull} has received offset commits from consumers as well " +
           s"as transactional producers. Mixing both types of offset commits will generally result in surprises and " +
@@ -400,10 +402,7 @@ title: Kafka Consumer(三)
               throw new IllegalStateException("Append status %s should only have one partition %s"
                 .format(responseStatus, offsetTopicPartition))
 
-            // construct the commit response status and insert
-            // the offset and metadata to cache if the append status has no error
             val status = responseStatus(offsetTopicPartition)
-
             val responseError = group.inLock {
               if (status.error == Errors.NONE) {
                 // append log无错误且group状态不为Dead情况下，根据offset提交类型分别进行更新缓存信息
@@ -482,5 +481,15 @@ title: Kafka Consumer(三)
     }
   }
 ```
+
+　　GroupCoordinator.storeOffsets()方法的处理过程大概归纳为：
+    1. 生成record, 
+    2. 进行更新pending缓存进行prepare
+    3. 进行log append
+    4. 更新pending缓存，更新
+
+　　在较新的版本的Kafka中，Offset这些元信息已经不用Zookeer进行存储，而是作为拥有一个内部Topic的消息，与普通消息一样存储在消息日志中，并且通过Kafka本身的主从同步机制做到一致性的维护，这样Kafka的元信息与普通的用户消息就统一起来了。
+
+　　另外，特别地Kafka支持同一个Group组合混合提交Tnx和普通的消费offset的提交，目前实现上Kafka只是打出了一个Warn信息进行提示。Kafka的作者并不建议这么混合使用，在使用时可以尽量避免，否则容易产生未预期的异常情况。
 
 ## TODO
