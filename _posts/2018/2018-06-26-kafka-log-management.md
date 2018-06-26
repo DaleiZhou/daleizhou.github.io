@@ -10,7 +10,7 @@ title: Kafka Log Management(一)
   代码版本: 2.0.0-SNAPSHOT
 
 
-　　在[Kafka log的读写分析](https://daleizhou.github.io/posts/log-fetch-produce.html)一文中有介绍过Kafka日志的结构，并提及Kafka会定期清理Segment。本文来具体看一下后台线程是如何完成清理工作，除此之外还一起看Kafka日志管理的其它内容，如：日志刷新，日志检查点设置等管理工作。
+　　在[Kafka log的读写分析](https://daleizhou.github.io/posts/log-fetch-produce.html)一文中有介绍过Kafka日志的结构，并提及Kafka会定期清理Segment。本文来具体看一下后台线程是如何完成清理工作，除此之外还一并涉及Kafka日志管理的其它内容，如：日志刷新，日志检查点设置等管理工作。因为功能点比较多，拆成两篇进行撰写。
 
 ## <a id="StartUp">StartUp</a>
 
@@ -219,6 +219,8 @@ title: Kafka Log Management(一)
           // 会调用Log.asyncDeleteSegment()方法中删除过程通过线程池并设置delay时间通过异步删除的方式移除Segment
           // 而延迟删除具体执行过程调用Segment.deleteIfExists()从文件系统中依次删除Segment对应的log,offsetIndex, timeIndex, TxnIndex等文件
           deletable.foreach(deleteSegment)
+
+          //如果剩余的Segment中第一个Segment的baseOffset > 现在log的StartOffset,则更新Log的StartOffset及相关的缓存信息
           maybeIncrementLogStartOffset(segments.firstEntry.getValue.baseOffset)
         }
       }
@@ -229,29 +231,63 @@ title: Kafka Log Management(一)
 
 　　我们可以看到日志清理部分的代码比较简单。具体过程就是定期根据最大保留时间，最大保留大小，LogStartOffset清理策略进行清理旧的Segment。当然在具体操作过程中还需要注意不能清理那些高于HWM的日志，因为这样会造成LogStartOffset大于HWM，从而引发系统问题。
 
-## <a id="flushDirtyLogs">flushDirtyLogs</a>
+## <a id="FlushDirtyLogs">FlushDirtyLogs</a>
+
+　　Kafka日志管理功能中另一个后台定时任务是将内存中的消息刷到磁盘中进行持久化。持久化过程需要考虑用户可能正在在同一台Broker上迁移日志，因此连同FutureLog一并Flush到磁盘。
 
 ```scala
   //LogManager.scala
-  /**
-   * Flush any log which has exceeded its flush interval and has unwritten messages.
-   */
+  // 基于超时时间的刷数据到日志文件
   private def flushDirtyLogs(): Unit = {
     debug("Checking for dirty logs to flush...")
 
+    // futureLogs是用户将副本在同一台Broker上从某个文件夹迁移到另一个文件夹下时被创建，当它赶上currentLogs后会替换掉currentLogs
+    // 这里清理过程中一并清理
     for ((topicPartition, log) <- currentLogs.toList ++ futureLogs.toList) {
       try {
+        // 距离上一次刷数据时间超过了配置的刷新间隔则将log中未持久化的数据刷到磁盘
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
-        debug("Checking if flush is needed on " + topicPartition.topic + " flush interval  " + log.config.flushMs +
-              " last flushed " + log.lastFlushTime + " time since last flush: " + timeSinceLastFlush)
         if(timeSinceLastFlush >= log.config.flushMs)
           log.flush
       } catch {
-        case e: Throwable =>
-          error("Error flushing topic " + topicPartition.topic, e)
+        // handle exception code ...
+      }
+    }
+  }
+```
+    
+　　距离上一次刷数据时间超过了配置的刷新间隔则将log中未持久化的数据刷到磁盘,通过调用Log.flush()方法，传入期望的最大刷入的偏移量进行持久化工作。
+
+```scala
+  // Log.scala
+  def flush(): Unit = flush(this.logEndOffset)
+
+  // 传入的Offset参数标识希望这次刷数据的最大偏移量(不包含)，并作为新的recoveryPoint
+  def flush(offset: Long) : Unit = {
+    maybeHandleIOException(s"Error while flushing log for $topicPartition in dir ${dir.getParent} with offset $offset") {
+      // this.recoveryPoint 这个参数表示第一个为被刷到磁盘上的偏移量
+      // 如果传入的Offset不大于这个值，刷入磁盘的最大offset大于这个预期的上线，所以什么也不做结束这个方法
+      if (offset <= this.recoveryPoint)
+        return
+      // 在[this.recoveryPoint, offset]区间内的所有logSegment逐个持久化
+      for (segment <- logSegments(this.recoveryPoint, offset))
+        //Segment对应的log, offsetIndex, timeIndex, txnIndex分别进行flush()写入磁盘
+        segment.flush()
+
+      lock synchronized {
+        checkIfMemoryMappedBufferClosed()
+        // 如果刷数据上限 > this.recoveryPoint, 则更新恢复点及更新lastFlushedTime
+        if (offset > this.recoveryPoint) {
+          this.recoveryPoint = offset
+          lastFlushedTime.set(time.milliseconds)
+        }
       }
     }
   }
 ```
 
-## TODO
+　　这个部分代码就更简单点，只是根据超时时间进行刷入数据。在刷入数据期间维护恢复点信息，标识最后一条刷入磁盘的消息的偏移量。如果该恢复点已经大于期望刷入磁盘消息的偏移量则什么也不做，否则获取符合范围的Segment列表逐个进行持久化，持久化过程依次是Segment对应的log, offsetIndex, timeIndex, txnIndex的持久化。
+
+## <a id="conclusion">总结</a>
+
+　　本篇从KafkaServer的启动讲起，介绍了LogManager的初始化过程，以及介绍了LogManager具体后台定时任务中的日志清理、内存数据持久化两个部分。代码过程比较简单，下一篇我们会将剩下的几个定时任务介绍完毕。
