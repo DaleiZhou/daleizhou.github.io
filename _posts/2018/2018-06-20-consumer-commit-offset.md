@@ -7,8 +7,6 @@ title: Kafka Consumer(三)
 ## 内容 
 >Status: Draft
 
-## TODO
-
   代码版本: 2.0.0-SNAPSHOT
 
 　　在[Kafka Consumer(一)](https://daleizhou.github.io/posts/consumer-subscribe.html)中介绍到通过KafkaConsumer.pollOnce()获取结果前会调用coordinator.poll()方法，在该方法中完成Coordinator,加入group等操作，该方法在最后还会调用maybeAutoCommitOffsetsAsync()来决定是否异步提交offset。本篇博文就从该方法讲起，追踪一下Offset的提交过程，算是对*Kafka Consumer*系列的补全。
@@ -105,6 +103,8 @@ title: Kafka Consumer(三)
         });
     }
 
+    // 构建offsetCommit请求并提交发送
+    // 本方法为非阻塞方法，返回feature，交给调用方进行处理结果
     private RequestFuture<Void> sendOffsetCommitRequest(final Map<TopicPartition, OffsetAndMetadata> offsets) {
         if (offsets.isEmpty())
             return RequestFuture.voidSuccess();
@@ -113,7 +113,7 @@ title: Kafka Consumer(三)
         if (coordinator == null)
             return RequestFuture.coordinatorNotAvailable();
 
-        // create the offset commit request
+        // 每个tp构造offset信息，用于构造OffsetCommitRequest请求
         Map<TopicPartition, OffsetCommitRequest.PartitionData> offsetData = new HashMap<>(offsets.size());
         for (Map.Entry<TopicPartition, OffsetAndMetadata> entry : offsets.entrySet()) {
             OffsetAndMetadata offsetAndMetadata = entry.getValue();
@@ -130,8 +130,7 @@ title: Kafka Consumer(三)
         else
             generation = Generation.NO_GENERATION;
 
-        // if the generation is null, we are not part of an active group (and we expect to be).
-        // the only thing we can do is fail the commit and let the user rejoin the group in poll()
+        // generation为null, 需要客户端进行rejoin
         if (generation == null)
             return RequestFuture.failure(new CommitFailedException());
 
@@ -142,12 +141,13 @@ title: Kafka Consumer(三)
 
         log.trace("Sending OffsetCommit request with {} to coordinator {}", offsets, coordinator);
 
+        // OffsetCommitResponseHandlers()设置了结果返回的回调处理过程，该过程有简单的打印log,或根据不同的code进行重试
         return client.send(coordinator, builder)
                 .compose(new OffsetCommitResponseHandler(offsets));
     }
 ```
 
-　　提交Offset的流程中，Consumer端做的工作比较简单，我们主要看kafkaApis处理OffsetCommit的具体流程。
+　　提交Offset的流程中，客户端将Tp消费到的Offset从缓存中读取，构建OffsetCommitRequest，利用client通过后台线程发送提交请求，该提交过程为非阻塞过程。从代码分析上看，Consumer端做的工作比较简单，我们主要看kafkaApis处理OffsetCommit的具体流程。
 
 ## <a id="handleOffsetCommitRequest">handleOffsetCommitRequest</a>
 
