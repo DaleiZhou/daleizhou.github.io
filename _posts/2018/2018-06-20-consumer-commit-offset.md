@@ -328,6 +328,9 @@ title: Kafka Consumer(三)
   }
 
 ```
+
+
+
 ```scala
   //GroupCoordinator.scala
   def storeOffsets(group: GroupMetadata,
@@ -483,6 +486,7 @@ title: Kafka Consumer(三)
 ```
 
 　　GroupCoordinator.storeOffsets()方法的处理过程大概归纳为：
+
     1. 生成record, 
     2. 进行更新pending缓存进行prepare
     3. 进行log append
