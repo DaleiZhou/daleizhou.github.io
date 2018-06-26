@@ -13,11 +13,6 @@ title: Kafka Consumer(三)
 
 　　在[Kafka Consumer(一)](https://daleizhou.github.io/posts/consumer-subscribe.html)中介绍到通过KafkaConsumer.pollOnce()获取结果前会调用coordinator.poll()方法，在该方法中完成Coordinator,加入group等操作，该方法在最后还会调用maybeAutoCommitOffsetsAsync()来决定是否异步提交offset。本篇博文就从该方法讲起，追踪一下Offset的提交过程，算是对*Kafka Consumer*系列的补全。
 
-我们带着如下问题去看这部分的代码：
-1. 什么时候提交offset
-2. 服务端将处理过程
-3. 客户端收到返回之后如何进行处理
-
 ## <a id="maybeAutoCommitOffsetsAsync">maybeAutoCommitOffsetsAsync</a>
 
 　　当KafkaConsumer启动设置了自动提交offset,maybeAutoCommitOffsetsAsyncKafka()方法才会真正起作用。当然如果用户有特殊需求，自己管理offset的提交也是可行的，Kafka同样提供了自行提交的调用方法。
@@ -276,7 +271,7 @@ title: Kafka Consumer(三)
   }
 ```
 
-　　groupCoordinator.handleCommitOffsets
+　　GroupCoordinator.handleCommitOffsets()方法
 
 ```scala
   //GroupCoordinator.scala
@@ -329,10 +324,10 @@ title: Kafka Consumer(三)
 
 ```
 
-
+　　实际进行offset持久化工作主要是在GroupMetaManager.storeOffsets()方法中进行，该方法构建MemoryRecords后通过ReplicaManager进行append操作，将offset记录写入到log文件进行持久化。
 
 ```scala
-  //GroupCoordinator.scala
+  //GroupMetaManager.scala
   def storeOffsets(group: GroupMetadata,
                    consumerId: String,
                    offsetMetadata: immutable.Map[TopicPartition, OffsetAndMetadata],
@@ -487,10 +482,10 @@ title: Kafka Consumer(三)
 
 　　GroupCoordinator.storeOffsets()方法的处理过程大概归纳为：
 
-    1. 生成record, 
-    2. 进行更新pending缓存进行prepare
-    3. 进行log append
-    4. 更新pending缓存，更新
+    * 生成record, 
+    * 进行更新pending缓存进行prepare
+    * 进行log append
+    * 根据结果进行pending缓存更新
 
 　　在较新的版本的Kafka中，Offset这些元信息已经不用Zookeer进行存储，而是作为拥有一个内部Topic的消息，与普通消息一样存储在消息日志中，并且通过Kafka本身的主从同步机制做到一致性的维护，这样Kafka的元信息与普通的用户消息就统一起来了。
 
