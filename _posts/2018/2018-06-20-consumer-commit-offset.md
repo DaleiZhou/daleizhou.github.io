@@ -293,13 +293,11 @@ title: Kafka Consumer(三)
         groupManager.getGroup(groupId) match {
           case None =>
             if (generationId < 0) {
-              // the group is not relying on Kafka for group management, so allow the commit
               // group的管理不通过groupManager来协调，generationId < 0且不在已保存的group缓存中，生成GroupMetadata加入group缓存
               val group = groupManager.addGroup(new GroupMetadata(groupId, initialState = Empty))
               doCommitOffsets(group, memberId, generationId, NO_PRODUCER_ID, NO_PRODUCER_EPOCH,
                 offsetMetadata, responseCallback)
             } else {
-              // or this is a request coming from an older generation. either way, reject the commit
               // 如果本地Group缓存中没有该group信息，但generationId >=0 则是一个前代留下的，因此直接拒绝请求，客户端收到ILLEGAL_GENERATION会进行resetGeneration
               responseCallback(offsetMetadata.mapValues(_ => Errors.ILLEGAL_GENERATION))
             }
@@ -321,17 +319,7 @@ title: Kafka Consumer(三)
                               responseCallback: immutable.Map[TopicPartition, Errors] => Unit) {
     group.inLock {
       if (group.is(Dead)) {
-        responseCallback(offsetMetadata.mapValues(_ => Errors.UNKNOWN_MEMBER_ID))
-      } else if ((generationId < 0 && group.is(Empty)) || (producerId != NO_PRODUCER_ID)) {
-        // The group is only using Kafka to store offsets.
-        // Also, for transactional offset commits we don't need to validate group membership and the generation.
-        groupManager.storeOffsets(group, memberId, offsetMetadata, responseCallback, producerId, producerEpoch)
-      } else if (group.is(CompletingRebalance)) {
-        responseCallback(offsetMetadata.mapValues(_ => Errors.REBALANCE_IN_PROGRESS))
-      } else if (!group.has(memberId)) {
-        responseCallback(offsetMetadata.mapValues(_ => Errors.UNKNOWN_MEMBER_ID))
-      } else if (generationId != group.generationId) {
-        responseCallback(offsetMetadata.mapValues(_ => Errors.ILLEGAL_GENERATION))
+        // 异常情况处理... 
       } else {
         val member = group.get(memberId)
         completeAndScheduleNextHeartbeatExpiration(group, member)
@@ -346,22 +334,28 @@ title: Kafka Consumer(三)
                    responseCallback: immutable.Map[TopicPartition, Errors] => Unit,
                    producerId: Long = RecordBatch.NO_PRODUCER_ID,
                    producerEpoch: Short = RecordBatch.NO_PRODUCER_EPOCH): Unit = {
-    // first filter out partitions with offset metadata size exceeding limit
+    // 验证metadata数据的合法性，为null或过大的offsetMetadata都过滤掉
     val filteredOffsetMetadata = offsetMetadata.filter { case (_, offsetAndMetadata) =>
       validateOffsetMetadataLength(offsetAndMetadata.metadata)
     }
 
     group.inLock {
+      // 当JoinGroup时GroupMeta.initNextGeneration()初始化，将receivedConsumerOffsetCommits， 
+      // receivedTransactionalOffsetCommits都设置为false 条件不成立,不会warn
+      // 而当 group接受两种类型的offset提交混用时，可能会产生异常，给一个warn提示
+      // 可能kafka的作者不建议混用
       if (!group.hasReceivedConsistentOffsetCommits)
         warn(s"group: ${group.groupId} with leader: ${group.leaderOrNull} has received offset commits from consumers as well " +
           s"as transactional producers. Mixing both types of offset commits will generally result in surprises and " +
           s"should be avoided.")
     }
 
+    // 非事务型offset提交传入的ProducerId为默认的NO_PRODUCER_ID
     val isTxnOffsetCommit = producerId != RecordBatch.NO_PRODUCER_ID
     // construct the message set to append
     if (filteredOffsetMetadata.isEmpty) {
       // compute the final error codes for the commit response
+      // 如果offsetMetadata所有数据都没通过大小限制的检查则直接报错给用户提示OFFSET_METADATA_TOO_LARGE
       val commitStatus = offsetMetadata.mapValues(_ => Errors.OFFSET_METADATA_TOO_LARGE)
       responseCallback(commitStatus)
       None
@@ -372,26 +366,36 @@ title: Kafka Consumer(三)
           val timestampType = TimestampType.CREATE_TIME
           val timestamp = time.milliseconds()
 
+          // 每个tp分别生成一个record,组合成一个recordBatch记录
           val records = filteredOffsetMetadata.map { case (topicPartition, offsetAndMetadata) =>
+            // key: [Group Topic Partition]
             val key = GroupMetadataManager.offsetCommitKey(group.groupId, topicPartition)
+            // value: [offset metadata commitTimestamp expireTimestamp]
             val value = GroupMetadataManager.offsetCommitValue(offsetAndMetadata)
+            // Record: [timestamp, key, value]
             new SimpleRecord(timestamp, key, value)
           }
+
+          // 根据groupId获得该group存储offset对应的topicPartition
+          // 这是专门存储offset的内部消息，topic名为：__consumer_offsets
           val offsetTopicPartition = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partitionFor(group.groupId))
           val buffer = ByteBuffer.allocate(AbstractRecords.estimateSizeInBytes(magicValue, compressionType, records.asJava))
 
+          // 版本为2以下的客户端不支持提交事务offset
           if (isTxnOffsetCommit && magicValue < RecordBatch.MAGIC_VALUE_V2)
             throw Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT.exception("Attempting to make a transaction offset commit with an invalid magic: " + magicValue)
-
+          // 生成MemoryRecordsBuilder用于后续的消息的append
           val builder = MemoryRecords.builder(buffer, magicValue, compressionType, timestampType, 0L, time.milliseconds(),
             producerId, producerEpoch, 0, isTxnOffsetCommit, RecordBatch.NO_PARTITION_LEADER_EPOCH)
 
+          //逐条append到MemoryRecordsBuilder中
           records.foreach(builder.append)
           val entries = Map(offsetTopicPartition -> builder.build())
 
-          // set the callback function to insert offsets into cache after log append completed
+          // putCacheCallback()方法用于appendLog操作结束之后的回调，作用是
           def putCacheCallback(responseStatus: Map[TopicPartition, PartitionResponse]) {
             // the append response should only contain the topics partition
+            // 有且仅有一个tp能写入成功，且tp为上文中的通过groupId获取的内部topic的一个topicPartition，否则直接抛异常退出
             if (responseStatus.size != 1 || !responseStatus.contains(offsetTopicPartition))
               throw new IllegalStateException("Append status %s should only have one partition %s"
                 .format(responseStatus, offsetTopicPartition))
@@ -402,19 +406,27 @@ title: Kafka Consumer(三)
 
             val responseError = group.inLock {
               if (status.error == Errors.NONE) {
+                // append log无错误且group状态不为Dead情况下，根据offset提交类型分别进行更新缓存信息
                 if (!group.is(Dead)) {
                   filteredOffsetMetadata.foreach { case (topicPartition, offsetAndMetadata) =>
                     if (isTxnOffsetCommit)
+                      // 如果是TxnOffset的提交的完成操作
+                      // 在pendingTransactionalOffsetCommits缓存中通过ProducerId找到对应的(tp, commitRecordMetadataAndOffset) key value对，
+                      //更新value为 CommitRecordMetadataAndOffset(Some(status.baseOffset), offsetAndMetadata)
+                      // 即更新了appendedBatchOffset
                       group.onTxnOffsetCommitAppend(producerId, topicPartition, CommitRecordMetadataAndOffset(Some(status.baseOffset), offsetAndMetadata))
                     else
+                      // 在pendingOffsetCommits缓存中移除，并将新的offset写入offsets缓存
                       group.onOffsetCommitAppend(topicPartition, CommitRecordMetadataAndOffset(Some(status.baseOffset), offsetAndMetadata))
                   }
                 }
                 Errors.NONE
               } else {
                 if (!group.is(Dead)) {
+                  // 异常处理，当group没有pending状态的offset提交时从openGroupsForProducer移除ProducerId对应的这个groupId
                   if (!group.hasPendingOffsetCommitsFromProducer(producerId))
                     removeProducerGroup(producerId, group.groupId)
+                  // 根据类型从各自的缓存中移除pending的请求
                   filteredOffsetMetadata.foreach { case (topicPartition, offsetAndMetadata) =>
                     if (isTxnOffsetCommit)
                       group.failPendingTxnOffsetCommit(producerId, topicPartition)
@@ -423,26 +435,8 @@ title: Kafka Consumer(三)
                   }
                 }
 
-                debug(s"Offset commit $filteredOffsetMetadata from group ${group.groupId}, consumer $consumerId " +
-                  s"with generation ${group.generationId} failed when appending to log due to ${status.error.exceptionName}")
-
-                // transform the log append error code to the corresponding the commit status error code
-                status.error match {
-                  case Errors.UNKNOWN_TOPIC_OR_PARTITION
-                       | Errors.NOT_ENOUGH_REPLICAS
-                       | Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND =>
-                    Errors.COORDINATOR_NOT_AVAILABLE
-
-                  case Errors.NOT_LEADER_FOR_PARTITION
-                       | Errors.KAFKA_STORAGE_ERROR =>
-                    Errors.NOT_COORDINATOR
-
-                  case Errors.MESSAGE_TOO_LARGE
-                       | Errors.RECORD_LIST_TOO_LARGE
-                       | Errors.INVALID_FETCH_SIZE =>
-                    Errors.INVALID_COMMIT_OFFSET_SIZE
-
-                  case other => other
+                // some log code ...
+                // 将append log返回的code处理成client的error code...
                 }
               }
             }
@@ -455,23 +449,29 @@ title: Kafka Consumer(三)
                 (topicPartition, Errors.OFFSET_METADATA_TOO_LARGE)
             }
 
-            // finally trigger the callback logic passed from the API layer
+            // 最终返回给客户的回调
             responseCallback(commitStatus)
           }
 
           if (isTxnOffsetCommit) {
             group.inLock {
+              // 如果是Txn类型的offset提交，则先在缓存openGroupsForProducer中根据producerId添加groupId
+              // openGroupsForProducer用于commit/abort marker秦秋接收到之后快速根据定位group
               addProducerGroup(producerId, group.groupId)
+              // prepareTxnOffsetCommit()中往pendingTransactionalOffsetCommits里写入(TopicPartition -> CommitRecordMetadataAndOffset)
               group.prepareTxnOffsetCommit(producerId, offsetMetadata)
             }
           } else {
             group.inLock {
+              // pendingOffsetCommits 缓存中加入offsetMetadata
               group.prepareOffsetCommit(offsetMetadata)
             }
           }
 
+          // 调用replicamanager的appendRecords()方法，进行往本地的消息日志中写入records
           appendForGroup(group, entries, putCacheCallback)
 
+        // 如果tp不是本broker上缓存里的分区，返回NOT_COORDINATOR交给客户端，让其进行重新查找COORDINATOR
         case None =>
           val commitStatus = offsetMetadata.map { case (topicPartition, _) =>
             (topicPartition, Errors.NOT_COORDINATOR)
