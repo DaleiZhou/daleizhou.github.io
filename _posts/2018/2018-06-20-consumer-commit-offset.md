@@ -482,10 +482,10 @@ title: Kafka Consumer(三)
 
 　　GroupCoordinator.storeOffsets()方法的处理过程大概归纳为：
 
-* 生成record, 
-* 进行更新pending缓存进行prepare
-* 进行log append
-* 根据结果进行pending缓存更新
+        1. 生成record, 
+        2. 进行更新pending缓存进行prepare
+        3. 进行log append
+        4. 根据结果进行pending缓存更新
 
 　　在较新的版本的Kafka中，Offset这些元信息已经不用Zookeer进行存储，而是作为拥有一个内部Topic的消息，与普通消息一样存储在消息日志中，并且通过Kafka本身的主从同步机制做到一致性的维护，这样Kafka的元信息与普通的用户消息就统一起来了。
 
@@ -493,5 +493,6 @@ title: Kafka Consumer(三)
 
 ## <a id="conclusion">总结</a>
 
-　　本文从KafkaComsumer.pollOnce()方法每次都会触发的maybeAutoCommitOffsetsAsync()方法讲起，如果客户端配置了自动提交offset的配置，客户端此时会进行异步提交offset信息。在Broker端，Kafka将Offset信息与普通的业务消息抽象成同样的处理方法，都写入broker的消息log中，并通过Kafka本身的同步机制进行主从同步。
+　　本文从KafkaComsumer.pollOnce()方法每次都会触发的maybeAutoCommitOffsetsAsync()方法讲起，介绍了Kafka提交消费Offset的过程，这个过程比较简单，没有很深的流程。如果客户端配置了自动提交offset的配置，客户端在PollOnce()时会进行异步提交offset信息。在Broker端，Kafka将Offset信息与普通的业务消息抽象成同样的处理方法，都写入broker的消息log中，并通过Kafka本身的同步机制进行主从同步。
+
 
