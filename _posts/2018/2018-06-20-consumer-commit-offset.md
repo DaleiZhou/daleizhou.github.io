@@ -271,7 +271,7 @@ title: Kafka Consumer(三)
   }
 ```
 
-　　GroupCoordinator.handleCommitOffsets()方法
+　　在正常流程的情况下，根据不同的客户端版本号对传入的partitionData进行一些修改，如更新时间戳等，最后会调用GroupCoordinator.handleCommitOffsets()方法将topicPartition的offset信息写入到本地log中并进行缓存更新。
 
 ```scala
   //GroupCoordinator.scala
@@ -324,7 +324,7 @@ title: Kafka Consumer(三)
 
 ```
 
-　　实际进行offset持久化工作主要是在GroupMetaManager.storeOffsets()方法中进行，该方法构建MemoryRecords后通过ReplicaManager进行append操作，将offset记录写入到log文件进行持久化。
+　　GroupMetaManager.storeOffsets()方法进行offset持久化工作，该方法构建MemoryRecords后通过ReplicaManager进行append操作，将offset记录写入到log文件进行持久化。
 
 ```scala
   //GroupMetaManager.scala
@@ -482,13 +482,16 @@ title: Kafka Consumer(三)
 
 　　GroupCoordinator.storeOffsets()方法的处理过程大概归纳为：
 
-    * 生成record, 
-    * 进行更新pending缓存进行prepare
-    * 进行log append
-    * 根据结果进行pending缓存更新
+* 生成record, 
+* 进行更新pending缓存进行prepare
+* 进行log append
+* 根据结果进行pending缓存更新
 
 　　在较新的版本的Kafka中，Offset这些元信息已经不用Zookeer进行存储，而是作为拥有一个内部Topic的消息，与普通消息一样存储在消息日志中，并且通过Kafka本身的主从同步机制做到一致性的维护，这样Kafka的元信息与普通的用户消息就统一起来了。
 
 　　另外，特别地Kafka支持同一个Group组合混合提交Tnx和普通的消费offset的提交，目前实现上Kafka只是打出了一个Warn信息进行提示。Kafka的作者并不建议这么混合使用，在使用时可以尽量避免，否则容易产生未预期的异常情况。
 
-## TODO
+## <a id="conclusion">总结</a>
+
+　　本文从KafkaComsumer.pollOnce()方法每次都会触发的maybeAutoCommitOffsetsAsync()方法讲起，如果客户端配置了自动提交offset的配置，客户端此时会进行异步提交offset信息。在Broker端，Kafka将Offset信息与普通的业务消息抽象成同样的处理方法，都写入broker的消息log中，并通过Kafka本身的同步机制进行主从同步。
+

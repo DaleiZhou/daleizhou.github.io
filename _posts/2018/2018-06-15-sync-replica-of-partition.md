@@ -612,9 +612,9 @@ makeLeaders()方法进行停止fetcher线程，更新缓存等。如果本Broker
   }
 ```
 
+　　至此，从controller到同步线程的拉取数据同步循环就介绍完毕了。
+
 ## <a id="conclusion">总结</a>
 
 　　本文从KafkaServer的启动切入，介绍了集群在启动时全局会选举一个Controller，负责Topic创建删除，副本选举，副本重新分配等事件的处理。在启动后向各个Broker发送各自所有的分区对应的LeaderAndIsrRequest。各个Broker对所拥有的副本做处理。特别地，如果本地副本角色为follower,则开启同步线程定期从leader中拉取数据进行，并修改本地offset等缓存。
-
-　　至此，从controller到同步线程的拉取数据同步循环就介绍完毕了。
 
