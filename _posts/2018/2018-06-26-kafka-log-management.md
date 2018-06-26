@@ -35,15 +35,97 @@ title: Kafka Log Management(一)
 
 　　KafkaServer启动过程中，构建一个线程池用于后台线程的执行。并将改线程池作为参数注入到LogManager中生成logManager。初始化完毕之后进行启动。下面先来看具体的初始化过程。
 
-
-## TODO: daleizhou init
-
 ```scala
   //LogManager.scala
+  private def loadLogs(): Unit = {
+    info("Loading logs.")
+    val startMs = time.milliseconds
+    val threadPools = ArrayBuffer.empty[ExecutorService]
+    val offlineDirs = mutable.Set.empty[(String, IOException)]
+    val jobs = mutable.Map.empty[File, Seq[Future[_]]]
+
+    for (dir <- liveLogDirs) {
+      try {
+        val pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir)
+        threadPools.append(pool)
+
+        val cleanShutdownFile = new File(dir, Log.CleanShutdownFile)
+
+        if (cleanShutdownFile.exists) {
+          debug(s"Found clean shutdown file. Skipping recovery for all logs in data directory: ${dir.getAbsolutePath}")
+        } else {
+          // log recovery itself is being performed by `Log` class during initialization
+          brokerState.newState(RecoveringFromUncleanShutdown)
+        }
+
+        var recoveryPoints = Map[TopicPartition, Long]()
+        try {
+          recoveryPoints = this.recoveryPointCheckpoints(dir).read
+        } catch {
+          case e: Exception =>
+            warn("Error occurred while reading recovery-point-offset-checkpoint file of directory " + dir, e)
+            warn("Resetting the recovery checkpoint to 0")
+        }
+
+        var logStartOffsets = Map[TopicPartition, Long]()
+        try {
+          logStartOffsets = this.logStartOffsetCheckpoints(dir).read
+        } catch {
+          case e: Exception =>
+            warn("Error occurred while reading log-start-offset-checkpoint file of directory " + dir, e)
+        }
+
+        val jobsForDir = for {
+          dirContent <- Option(dir.listFiles).toList
+          logDir <- dirContent if logDir.isDirectory
+        } yield {
+          CoreUtils.runnable {
+            try {
+              loadLog(logDir, recoveryPoints, logStartOffsets)
+            } catch {
+              case e: IOException =>
+                offlineDirs.add((dir.getAbsolutePath, e))
+                error("Error while loading log dir " + dir.getAbsolutePath, e)
+            }
+          }
+        }
+        jobs(cleanShutdownFile) = jobsForDir.map(pool.submit)
+      } catch {
+        case e: IOException =>
+          offlineDirs.add((dir.getAbsolutePath, e))
+          error("Error while loading log dir " + dir.getAbsolutePath, e)
+      }
+    }
+
+    try {
+      for ((cleanShutdownFile, dirJobs) <- jobs) {
+        dirJobs.foreach(_.get)
+        try {
+          cleanShutdownFile.delete()
+        } catch {
+          case e: IOException =>
+            offlineDirs.add((cleanShutdownFile.getParent, e))
+            error(s"Error while deleting the clean shutdown file $cleanShutdownFile", e)
+        }
+      }
+
+      offlineDirs.foreach { case (dir, e) =>
+        logDirFailureChannel.maybeAddOfflineLogDir(dir, s"Error while deleting the clean shutdown file in dir $dir", e)
+      }
+    } catch {
+      case e: ExecutionException =>
+        error("There was an error in one of the threads during logs loading: " + e.getCause)
+        throw e.getCause
+    } finally {
+      threadPools.foreach(_.shutdown())
+    }
+
+    info(s"Logs loading complete in ${time.milliseconds - startMs} ms.")
+  }
 
 ```
 
-
+　　初始化完毕之后，KafkaServer调用LogManager.startup()方法，正式将LogManager模块启动。启动过程设置了五个定时任务，分别有cleanupLogs，flushDirtyLogs，checkpointLogRecoveryOffsets，checkpointLogStartOffsets，deleteLogs等后台任务。
 
 ```scala
   // LogManager.scala
@@ -89,7 +171,7 @@ title: Kafka Log Management(一)
 
 ```
 
-下面分节来看具体的日志管理的源码实现。
+　　下面分节来看具体的日志管理的源码实现。
 
 ## <a id="CleanupLogs">CleanupLogs</a>
 
