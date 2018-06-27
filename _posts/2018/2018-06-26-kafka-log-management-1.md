@@ -9,7 +9,6 @@ title: Kafka Log Management(一)
 
   代码版本: 2.0.0-SNAPSHOT
 
-
 　　在[Kafka log的读写分析](https://daleizhou.github.io/posts/log-fetch-produce.html)一文中有介绍过Kafka日志的结构，并提及Kafka会定期清理Segment。本文来具体看一下后台线程是如何完成清理工作，除此之外还一并涉及Kafka日志管理的其它内容，如：日志刷新，日志检查点设置等管理工作。因为功能点比较多，拆成两篇进行撰写。
 
 ## <a id="StartUp">StartUp</a>
@@ -33,10 +32,54 @@ title: Kafka Log Management(一)
     }
 ```
 
-　　KafkaServer启动过程中，构建一个线程池用于后台线程的执行。并将改线程池作为参数注入到LogManager中生成logManager。初始化完毕之后进行启动。下面先来看具体的初始化过程。
+　　KafkaServer启动过程中，构建一个线程池用于后台线程的执行。并将改线程池作为参数注入到LogManager中生成logManager。初始化完毕之后进行启动。LogManager初始化主要调用了createAndValidateLogDirs()方法和loadLogs()方法。下面来逐一进行跟踪源码。
 
 ```scala
   //LogManager.scala
+  // 用于创建并验证日志目录的合法性
+  private def createAndValidateLogDirs(dirs: Seq[File], initialOfflineDirs: Seq[File]): ConcurrentLinkedQueue[File] = {
+    // 1. 确保传入的logDirs缓存中无重复目录，如果有则直接抛异常
+    if(dirs.map(_.getCanonicalPath).toSet.size < dirs.size)
+      throw new KafkaException("Duplicate log directory found: " + dirs.mkString(", "))
+
+    val liveLogDirs = new ConcurrentLinkedQueue[File]()
+
+    for (dir <- dirs) {
+      try {
+        // liveLogDirs与offline日志目录不能有重叠情况
+        if (initialOfflineDirs.contains(dir))
+          throw new IOException(s"Failed to load ${dir.getAbsolutePath} during broker startup")
+        // 2. 如果日志目录不存在，则创建出来
+        if (!dir.exists) {
+          info("Log directory '" + dir.getAbsolutePath + "' not found, creating it.")
+          val created = dir.mkdirs()
+          if (!created)
+            throw new IOException("Failed to create data directory " + dir.getAbsolutePath)
+        }
+        // 3. 确保每个日志目录是个目录且有可读权限
+        if (!dir.isDirectory || !dir.canRead)
+          throw new IOException(dir.getAbsolutePath + " is not a readable log directory.")
+        liveLogDirs.add(dir)
+      } catch {
+        // 异常处理 code ...
+      }
+    }
+
+    // 工作log目录不能为空，一个都没有则直接退出
+    if (liveLogDirs.isEmpty) {
+      Exit.halt(1)
+    }
+
+    liveLogDirs
+  }
+
+```
+
+　　Kafka的LogManager初始化时，通过createAndValidateLogDirs()方法进行创建和验证liveLogDir的正确性，要求liveLogDir不能有重复元素，与Offline不能有重叠，且有刻度权限。当目录不存在时则创建出来。
+
+　　初始化完各种缓存信息，构建完各种目录结构之后就调用loadLogs()方法载入日志，只有载入完毕之后，Broker才能正常对外提供服务，后台的日志管理定时任务也才能开始进行工作。下面看这部分的源码实现:
+
+```scala
   private def loadLogs(): Unit = {
     info("Loading logs.")
     val startMs = time.milliseconds
@@ -171,7 +214,86 @@ title: Kafka Log Management(一)
 
 ```
 
-　　初始化完毕之后，KafkaServer调用LogManager.startup()方法，正式将LogManager模块启动。启动过程设置了五个定时任务，分别有cleanupLogs，flushDirtyLogs，checkpointLogRecoveryOffsets，checkpointLogStartOffsets，deleteLogs等后台任务。
+　　loadLog()方法主要是根据一些参数来对每个TopicPartition生成Log对象，用于对每个TopicPartition的日志的操作。主要初始化过程如下：
+
+```scala
+  // Log.scala
+  class Log(@volatile var dir: File,
+          @volatile var config: LogConfig,
+          @volatile var logStartOffset: Long,
+          @volatile var recoveryPoint: Long,
+          scheduler: Scheduler,
+          brokerTopicStats: BrokerTopicStats,
+          time: Time,
+          val maxProducerIdExpirationMs: Int,
+          val producerIdExpirationCheckIntervalMs: Int,
+          val topicPartition: TopicPartition,
+          val producerStateManager: ProducerStateManager,
+          logDirFailureChannel: LogDirFailureChannel) extends Logging with KafkaMetricsGroup {
+
+      // 上一次flush的时间，用于日志管理中定期将内存数据刷入磁盘
+      private val lastFlushedTime = new AtomicLong(time.milliseconds)
+
+      // highWatermark
+      @volatile private var replicaHighWatermark: Option[Long] = None
+
+      // Kafka的log由顺序的Segment组成
+      private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] = new ConcurrentSkipListMap[java.lang.Long, LogSegment]
+
+      // 为TopicPartition构建LeaderEpoch => Offset 映射缓存
+      @volatile private var _leaderEpochCache: LeaderEpochCache = initializeLeaderEpochCache()
+
+      locally {
+        val startMs = time.milliseconds
+        // 载入Segment
+        val nextOffset = loadSegments()
+
+        /* Calculate the offset of the next message */
+        nextOffsetMetadata = new LogOffsetMetadata(nextOffset, activeSegment.baseOffset, activeSegment.size)
+
+        _leaderEpochCache.clearAndFlushLatest(nextOffsetMetadata.messageOffset)
+
+        logStartOffset = math.max(logStartOffset, segments.firstEntry.getValue.baseOffset)
+
+        // The earliest leader epoch may not be flushed during a hard failure. Recover it here.
+        _leaderEpochCache.clearAndFlushEarliest(logStartOffset)
+
+        loadProducerState(logEndOffset, reloadFromCleanShutdown = hasCleanShutdownFile)
+      }
+  }
+
+  // 从磁盘中log文件载入log的Segment
+  private def loadSegments(): Long = {
+    // 清理临时文件，收集Swap文件，中断Swap操作。
+    val swapFiles = removeTempFilesAndCollectSwapFiles()
+
+    // 载入Segment 和Index文件，将Segment依次加入cache中
+    loadSegmentFiles()
+
+    // 完成被中断的swap操作。载入SwapSegment并替换对应的Segment,为了保持不crash系统，旧的log文件添加.deleted后缀，后面的定时任务或者下次的系统重启会删除
+    completeSwapOperations(swapFiles)
+
+    if (logSegments.isEmpty) {
+      // 如果Segment列表为空，则新建第一个Segment作为起始
+      addSegment(LogSegment.open(dir = dir,
+        baseOffset = 0,
+        config,
+        time = time,
+        fileAlreadyExists = false,
+        initFileSize = this.initFileSize,
+        preallocate = config.preallocate))
+      0
+    } else if (!dir.getAbsolutePath.endsWith(Log.DeleteDirSuffix)) {
+      // 根据snapshot恢复Segment各种缓存，根据record进行事务处理初始化等工作
+      val nextOffset = recoverLog()
+      activeSegment.resizeIndexes(config.maxIndexSize)
+      nextOffset
+    } else 0
+  }
+
+```
+
+　　经过上述过程，Kafka的Broker在启动时就初始化了一个LogManager用于日志的管理工作。初始化完毕之后，KafkaServer调用LogManager.startup()方法，正式将LogManager模块启动。启动过程设置了五个定时任务，分别有cleanupLogs，flushDirtyLogs，checkpointLogRecoveryOffsets，checkpointLogStartOffsets，deleteLogs等后台任务。
 
 ```scala
   // LogManager.scala
@@ -204,7 +326,7 @@ title: Kafka Log Management(一)
                          delay = InitialTaskDelayMs,
                          period = flushStartOffsetCheckpointMs,
                          TimeUnit.MILLISECONDS)
-      // 日志删除
+      // 定时删除标记为-delete的日志
       scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
                          deleteLogs _,
                          delay = InitialTaskDelayMs,

@@ -68,10 +68,94 @@ title: Kafka Log Management(二)
   }
 ```
 
-　　删除旧的SnapShot过程中，有个小的trick是根据文件名直接取offset来判断是否需要删除
+　　删除旧的SnapShot过程中，有个小的trick是根据文件名直接取offset来判断是否需要删除。
 
 ## <a id="CheckpointLogStartOffsets">CheckpointLogStartOffsets</a>
 
+```scala
+  // LogManager.scala
+  /**
+   * Write out the current log start offset for all logs to a text file in the log directory
+   * to avoid exposing data that have been deleted by DeleteRecordsRequest
+   */
+  def checkpointLogStartOffsets() {
+    liveLogDirs.foreach(checkpointLogStartOffsetsInDir)
+  }
+
+  /**
+   * Checkpoint log start offset for all logs in provided directory.
+   */
+  private def checkpointLogStartOffsetsInDir(dir: File): Unit = {
+    for {
+      partitionToLog <- logsByDir.get(dir.getAbsolutePath)
+      checkpoint <- logStartOffsetCheckpoints.get(dir)
+    } {
+      try {
+        val logStartOffsets = partitionToLog.filter { case (_, log) =>
+          log.logStartOffset > log.logSegments.head.baseOffset
+        }.mapValues(_.logStartOffset)
+        checkpoint.write(logStartOffsets)
+      } catch {
+        case e: IOException =>
+          logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath, s"Disk error while writing to logStartOffset file in directory $dir", e)
+      }
+    }
+  }
+```
+
 ## <a id="DeleteLogs">DeleteLogs</a>
 
+```scala
+  // LogManager.scala
+  /**
+   *  Delete logs marked for deletion. Delete all logs for which `currentDefaultConfig.fileDeleteDelayMs`
+   *  has elapsed after the delete was scheduled. Logs for which this interval has not yet elapsed will be
+   *  considered for deletion in the next iteration of `deleteLogs`. The next iteration will be executed
+   *  after the remaining time for the first log that is not deleted. If there are no more `logsToBeDeleted`,
+   *  `deleteLogs` will be executed after `currentDefaultConfig.fileDeleteDelayMs`.
+   */
+  private def deleteLogs(): Unit = {
+    var nextDelayMs = 0L
+    try {
+      def nextDeleteDelayMs: Long = {
+        if (!logsToBeDeleted.isEmpty) {
+          val (_, scheduleTimeMs) = logsToBeDeleted.peek()
+          scheduleTimeMs + currentDefaultConfig.fileDeleteDelayMs - time.milliseconds()
+        } else
+          currentDefaultConfig.fileDeleteDelayMs
+      }
+
+      while ({nextDelayMs = nextDeleteDelayMs; nextDelayMs <= 0}) {
+        val (removedLog, _) = logsToBeDeleted.take()
+        if (removedLog != null) {
+          try {
+            removedLog.delete()
+            info(s"Deleted log for partition ${removedLog.topicPartition} in ${removedLog.dir.getAbsolutePath}.")
+          } catch {
+            case e: KafkaStorageException =>
+              error(s"Exception while deleting $removedLog in dir ${removedLog.dir.getParent}.", e)
+          }
+        }
+      }
+    } catch {
+      case e: Throwable =>
+        error(s"Exception in kafka-delete-logs thread.", e)
+    } finally {
+      try {
+        scheduler.schedule("kafka-delete-logs",
+          deleteLogs _,
+          delay = nextDelayMs,
+          unit = TimeUnit.MILLISECONDS)
+      } catch {
+        case e: Throwable =>
+          if (scheduler.isStarted) {
+            // No errors should occur unless scheduler has been shutdown
+            error(s"Failed to schedule next delete in kafka-delete-logs thread", e)
+          }
+      }
+    }
+  }
+```
+
 ## <a id="conclusion">总结</a>
+
