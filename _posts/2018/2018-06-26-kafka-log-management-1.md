@@ -138,7 +138,7 @@ title: Kafka Log Management(一)
         } yield {
           CoreUtils.runnable {
             try {
-              // 每个日志子目录生成一个job加载
+              // 每个日志子目录生成一个job加载log，并且根据读取的recoveryPoints, logStartOffsets进行加载
               loadLog(logDir, recoveryPoints, logStartOffsets)
             } catch {
               // handle exception code ...
@@ -327,7 +327,7 @@ title: Kafka Log Management(一)
                          period = flushStartOffsetCheckpointMs,
                          TimeUnit.MILLISECONDS)
       // 定时删除标记为-delete的日志
-      scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
+      scheduler.schedule("kafka-delete-logs", 
                          deleteLogs _,
                          delay = InitialTaskDelayMs,
                          unit = TimeUnit.MILLISECONDS)
@@ -339,7 +339,7 @@ title: Kafka Log Management(一)
 
 ```
 
-　　下面分节来看具体的日志管理的源码实现。
+　　在StartUp中，deleteLogs定时任务比较特殊，并未直接设置调度间隔。执行这部分的后台线程是由前一次后台任务完成时动态进行调度的。下面分节来看具体的日志管理的源码实现。
 
 ## <a id="CleanupLogs">CleanupLogs</a>
 

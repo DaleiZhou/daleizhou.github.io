@@ -68,16 +68,14 @@ title: Kafka Log Management(二)
   }
 ```
 
-　　删除旧的SnapShot过程中，有个小的trick是根据文件名直接取offset来判断是否需要删除。
+　　删除旧的SnapShot过程中，因为Segment文件命名的实现，因此可以根据文件名直接取offset来判断是否需要删除。
 
 ## <a id="CheckpointLogStartOffsets">CheckpointLogStartOffsets</a>
 
+　　LogManager中的另一个后台定时任务为checkpointLogStartOffsets。用于将各个TopicPartition的StartOffset写入到文本文件建立checkpoint，避免暴露被DeleteRecordsRequest请求删除的数据。下面看具体实现过程:
+
 ```scala
   // LogManager.scala
-  /**
-   * Write out the current log start offset for all logs to a text file in the log directory
-   * to avoid exposing data that have been deleted by DeleteRecordsRequest
-   */
   def checkpointLogStartOffsets() {
     liveLogDirs.foreach(checkpointLogStartOffsetsInDir)
   }
@@ -91,17 +89,26 @@ title: Kafka Log Management(二)
       checkpoint <- logStartOffsetCheckpoints.get(dir)
     } {
       try {
+        // 对文件夹下的log逐个判断，筛选出log的logStartOffset > log现有的第一个Segment的baseOffset
+        // 将所有筛选出来的(tp，offset)写入checkpoint文件
         val logStartOffsets = partitionToLog.filter { case (_, log) =>
           log.logStartOffset > log.logSegments.head.baseOffset
         }.mapValues(_.logStartOffset)
+        // Topic对应的startoffset信息写入检查点文件
+        // 文件为log-start-offset-checkpoint
+        // checkpoint file format:
+        // line1 : version
+        // line2 : expectedSize
+        // nlines: (tp, startoffset) 
         checkpoint.write(logStartOffsets)
       } catch {
-        case e: IOException =>
-          logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath, s"Disk error while writing to logStartOffset file in directory $dir", e)
+        // 异常处理 ... 
       }
     }
   }
 ```
+
+　　CheckPoint文件在系统启动加载日志时使用，避免了暴露那些被删除的数据。在筛选过程中将logStartOffset大于Segment的baseOffset取出来写入文本文件，这个部分的实现也很简单，没有复杂的过程。
 
 ## <a id="DeleteLogs">DeleteLogs</a>
 
@@ -142,15 +149,13 @@ title: Kafka Log Management(二)
         error(s"Exception in kafka-delete-logs thread.", e)
     } finally {
       try {
+        // 每次任务完成时，根据nextDelayMs动态设定下一次执行后台任务执行的时间
         scheduler.schedule("kafka-delete-logs",
           deleteLogs _,
           delay = nextDelayMs,
           unit = TimeUnit.MILLISECONDS)
       } catch {
-        case e: Throwable =>
-          if (scheduler.isStarted) {
-            // No errors should occur unless scheduler has been shutdown
-            error(s"Failed to schedule next delete in kafka-delete-logs thread", e)
+        // 异常处理 ... 
           }
       }
     }
