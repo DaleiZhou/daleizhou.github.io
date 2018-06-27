@@ -46,66 +46,78 @@ title: Kafka Log Management(一)
 
     for (dir <- liveLogDirs) {
       try {
+        // 对每个日志目录创建numRecoveryThreadsPerDataDir个线程组成的线程池，并加入threadPools中
         val pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir)
         threadPools.append(pool)
 
         val cleanShutdownFile = new File(dir, Log.CleanShutdownFile)
 
+        // 检查.kafka_cleanshutdown文件是否存在
+        // 存在则表示Kafka正在经历清理性的停机工作，此时跳过从本文件夹恢复日志
         if (cleanShutdownFile.exists) {
           debug(s"Found clean shutdown file. Skipping recovery for all logs in data directory: ${dir.getAbsolutePath}")
         } else {
           // log recovery itself is being performed by `Log` class during initialization
           brokerState.newState(RecoveringFromUncleanShutdown)
         }
-
+        // 从检查点文件读取Topic对应的恢复点offset信息
+        // 文件为recovery-point-offset-checkpoint
+        // checkpoint file format:
+        // line1 : version
+        // line2 : expectedSize
+        // nlines: (tp, offset) 
         var recoveryPoints = Map[TopicPartition, Long]()
         try {
           recoveryPoints = this.recoveryPointCheckpoints(dir).read
         } catch {
-          case e: Exception =>
-            warn("Error occurred while reading recovery-point-offset-checkpoint file of directory " + dir, e)
-            warn("Resetting the recovery checkpoint to 0")
+          // handle exception code ...
         }
 
+        
+        // 从检查点文件读取Topic对应的startoffset信息
+        // 文件为log-start-offset-checkpoint
+        // checkpoint file format:
+        // line1 : version
+        // line2 : expectedSize
+        // nlines: (tp, startoffset) 
         var logStartOffsets = Map[TopicPartition, Long]()
         try {
           logStartOffsets = this.logStartOffsetCheckpoints(dir).read
         } catch {
-          case e: Exception =>
-            warn("Error occurred while reading log-start-offset-checkpoint file of directory " + dir, e)
+          // handle exception code ...
         }
 
+        // 每个日志子目录生成一个线程池的具体job，并提交到线程池中
+        // 每个job的主要任务是通过loadLog()方法加载日志
         val jobsForDir = for {
           dirContent <- Option(dir.listFiles).toList
           logDir <- dirContent if logDir.isDirectory
         } yield {
           CoreUtils.runnable {
             try {
+              // 每个日志子目录生成一个job加载
               loadLog(logDir, recoveryPoints, logStartOffsets)
             } catch {
-              case e: IOException =>
-                offlineDirs.add((dir.getAbsolutePath, e))
-                error("Error while loading log dir " + dir.getAbsolutePath, e)
+              // handle exception code ...
             }
           }
         }
+        // 提交
         jobs(cleanShutdownFile) = jobsForDir.map(pool.submit)
       } catch {
-        case e: IOException =>
-          offlineDirs.add((dir.getAbsolutePath, e))
-          error("Error while loading log dir " + dir.getAbsolutePath, e)
+        // handle exception code ...
       }
     }
 
     try {
+      // 等待所有日志加载的job完成，删除对应的cleanShutdownFile
       for ((cleanShutdownFile, dirJobs) <- jobs) {
         dirJobs.foreach(_.get)
         try {
           cleanShutdownFile.delete()
         } catch {
           case e: IOException =>
-            offlineDirs.add((cleanShutdownFile.getParent, e))
-            error(s"Error while deleting the clean shutdown file $cleanShutdownFile", e)
+            // handle exception code ...
         }
       }
 
@@ -114,13 +126,47 @@ title: Kafka Log Management(一)
       }
     } catch {
       case e: ExecutionException =>
-        error("There was an error in one of the threads during logs loading: " + e.getCause)
-        throw e.getCause
+        // handle exception code ...
     } finally {
       threadPools.foreach(_.shutdown())
     }
 
-    info(s"Logs loading complete in ${time.milliseconds - startMs} ms.")
+    // log code ...
+  }
+
+  // 线程池中的job主要工作
+  private def loadLog(logDir: File, recoveryPoints: Map[TopicPartition, Long], logStartOffsets: Map[TopicPartition, Long]): Unit = {
+    val topicPartition = Log.parseTopicPartitionName(logDir)
+    val config = topicConfigs.getOrElse(topicPartition.topic, currentDefaultConfig)
+    val logRecoveryPoint = recoveryPoints.getOrElse(topicPartition, 0L)
+    val logStartOffset = logStartOffsets.getOrElse(topicPartition, 0L)
+
+    val log = Log(
+      dir = logDir,
+      config = config,
+      logStartOffset = logStartOffset,
+      recoveryPoint = logRecoveryPoint,
+      maxProducerIdExpirationMs = maxPidExpirationMs,
+      producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
+      scheduler = scheduler,
+      time = time,
+      brokerTopicStats = brokerTopicStats,
+      logDirFailureChannel = logDirFailureChannel)
+
+    // 如果以'-delete'为后缀，加入addLogToBeDeleted队列等待删除的定时任务
+    if (logDir.getName.endsWith(Log.DeleteDirSuffix)) {
+      addLogToBeDeleted(log)
+    } else {
+      val previous = {
+        if (log.isFuture)
+          this.futureLogs.put(topicPartition, log)
+        else
+          this.currentLogs.put(topicPartition, log)
+      }
+      if (previous != null) {
+        // handle exception code ...
+      }
+    }
   }
 
 ```
