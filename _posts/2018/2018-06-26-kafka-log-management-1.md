@@ -32,7 +32,7 @@ title: Kafka Log Management(一)
     }
 ```
 
-　　KafkaServer启动过程中，构建一个线程池用于后台线程的执行。并将改线程池作为参数注入到LogManager中生成logManager。初始化完毕之后进行启动。LogManager初始化主要调用了createAndValidateLogDirs()方法和loadLogs()方法。下面来逐一进行跟踪源码。
+　　KafkaServer启动过程中，构建一个线程池用于后台线程的执行。并将改线程池作为参数注入到LogManager中生成logManager。初始化完毕之后进行启动。LogManager初始化主要调用了createAndValidateLogDirs()方法和loadLogs()方法。初始化过程中还生成了一个Cleaner后台线程用于日志的压缩清理工作，这个部分暂时不展开描述，后面会专门写一章来描述工作过程。下面来逐一进行跟踪其他初始化部分的源码。
 
 ```scala
   //LogManager.scala
@@ -332,6 +332,7 @@ title: Kafka Log Management(一)
                          delay = InitialTaskDelayMs,
                          unit = TimeUnit.MILLISECONDS)
     }
+    // 日志清理压缩线程启动
     if (cleanerConfig.enableCleaner)
       cleaner.startup()
   }
@@ -339,7 +340,7 @@ title: Kafka Log Management(一)
 
 ```
 
-　　在StartUp中，deleteLogs定时任务比较特殊，并未直接设置调度间隔。执行这部分的后台线程是由前一次后台任务完成时动态进行调度的。下面分节来看具体的日志管理的源码实现。
+　　在StartUp中，deleteLogs定时任务比较特殊，并未直接设置调度间隔。执行这部分的后台线程是由前一次后台任务完成时动态进行调度的。在Startup()最后将cleaner线程启动，这个部分的具体工作过程在后面会有专门的文章介绍，下面只分节来看五个日志管理的后台任务的源码实现。
 
 ## <a id="CleanupLogs">CleanupLogs</a>
 
