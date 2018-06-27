@@ -112,41 +112,39 @@ title: Kafka Log Management(二)
 
 ## <a id="DeleteLogs">DeleteLogs</a>
 
+　　在一些情况下，如Swap日志替换等情况下需要删除一些log，为了提升系统效率，Kafka内部并不同步删除文件，而是加上.delete这样的后缀和加入待删除的队列中，后台的定时任务会分批统一进行清理。当然并不是加入删除队列的数据立马就会被删除，每次调度时只删除那些标记为删除超过一定时间的日志。下面看具体实现过程。
+
 ```scala
   // LogManager.scala
-  /**
-   *  Delete logs marked for deletion. Delete all logs for which `currentDefaultConfig.fileDeleteDelayMs`
-   *  has elapsed after the delete was scheduled. Logs for which this interval has not yet elapsed will be
-   *  considered for deletion in the next iteration of `deleteLogs`. The next iteration will be executed
-   *  after the remaining time for the first log that is not deleted. If there are no more `logsToBeDeleted`,
-   *  `deleteLogs` will be executed after `currentDefaultConfig.fileDeleteDelayMs`.
-   */
   private def deleteLogs(): Unit = {
     var nextDelayMs = 0L
     try {
+      // 下一次调度时间计算
       def nextDeleteDelayMs: Long = {
         if (!logsToBeDeleted.isEmpty) {
+          // 取要删除的日志第一个被设置要删除的系统时间
           val (_, scheduleTimeMs) = logsToBeDeleted.peek()
+          // 被调用要删除的时间 + fileDeleteDelayMs - now()即为下一次调度时间间隔
           scheduleTimeMs + currentDefaultConfig.fileDeleteDelayMs - time.milliseconds()
         } else
+          // 如果没有log需要删除，则使用配置中的fileDeleteDelayMs进行调度下一次任务
           currentDefaultConfig.fileDeleteDelayMs
       }
 
+      // 日志删除时间已经超过配置的fileDeleteDelayMs，进行日志删除
       while ({nextDelayMs = nextDeleteDelayMs; nextDelayMs <= 0}) {
         val (removedLog, _) = logsToBeDeleted.take()
         if (removedLog != null) {
           try {
+            // 删除日志对应的Segment，清理相关缓存等
             removedLog.delete()
-            info(s"Deleted log for partition ${removedLog.topicPartition} in ${removedLog.dir.getAbsolutePath}.")
           } catch {
-            case e: KafkaStorageException =>
-              error(s"Exception while deleting $removedLog in dir ${removedLog.dir.getParent}.", e)
+            // 异常处理 ...
           }
         }
       }
     } catch {
-      case e: Throwable =>
-        error(s"Exception in kafka-delete-logs thread.", e)
+      // 异常处理 ...
     } finally {
       try {
         // 每次任务完成时，根据nextDelayMs动态设定下一次执行后台任务执行的时间
@@ -163,4 +161,8 @@ title: Kafka Log Management(二)
 ```
 
 ## <a id="conclusion">总结</a>
+
+　　本文继[Kafka Log Management(一)](https://daleizhou.github.io/posts/kafka-log-management-1.html)介绍了剩下的三个定时任务，分别为CheckpointLogRecoveryOffsets,CheckpointLogStartOffsets,DeleteLogs。该三个定时任务过程都比较简单，唯一特殊点的就是DeleteLogs下一次的调度时间是动态的。
+
+　　至此，LogManager的启动过程及五个后台定时任务的具体实现也介绍完毕了。
 
