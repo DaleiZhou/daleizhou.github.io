@@ -119,7 +119,6 @@ title: Kafka Log Compaction
       }
     }
   }
-
 ```
 
 　　上述代码的作用是挑选一个压缩比例最高的，并且高于一定阈值的日志的待压缩区间，并生成LogClean对象用于控制起止步位置，计算压缩率等。每个TopicPartition对应日志的压缩终止位置是由三个值共同决定。首先压缩区域不能包含未完成的事务等，第二压缩区域不能包含activeSegment，第三找到第一个非activeSegment并且最大的时间戳已经超过清理等待时间。这三个值中取最小值来作为清理压缩的截止位置。
@@ -127,13 +126,14 @@ title: Kafka Log Compaction
 ```scala
   // LogCleaner.scala
   private def cleanOrSleep() {
+      // 获取压缩比例最高的那个log进行清理
       val cleaned = cleanerManager.grabFilthiestCompactedLog(time) match {
         case None =>
           false
         case Some(cleanable) =>
-          // there's a log, clean it
           var endOffset = cleanable.firstDirtyOffset
           try {
+            // cleaner.clean()进行清理日志，并返回第一个未被清理的offset和统计信息
             val (nextDirtyOffset, cleanerStats) = cleaner.clean(cleanable)
             recordStats(cleaner.id, cleanable.log.name, cleanable.firstDirtyOffset, endOffset, cleanerStats)
             endOffset = nextDirtyOffset
@@ -157,7 +157,225 @@ title: Kafka Log Compaction
         pause(config.backOffMs, TimeUnit.MILLISECONDS)
     }
 
+  private[log] def clean(cleanable: LogToClean): (Long, CleanerStats) = {
+    // figure out the timestamp below which it is safe to remove delete tombstones
+    // this position is defined to be a configurable time beneath the last modified time of the last clean segment
+    val deleteHorizonMs =
+      cleanable.log.logSegments(0, cleanable.firstDirtyOffset).lastOption match {
+        case None => 0L
+        case Some(seg) => seg.lastModified - cleanable.log.config.deleteRetentionMs
+    }
 
+    doClean(cleanable, deleteHorizonMs)
+  }
+
+  // 构建（key_hash -> offset） 这样的map用于日志的压缩清理
+  private[log] def buildOffsetMap(log: Log,
+                                  start: Long,
+                                  end: Long,
+                                  map: OffsetMap,
+                                  stats: CleanerStats) {
+    map.clear()
+    // 得到待压缩清理的segment
+    val dirty = log.logSegments(start, end).toBuffer
+
+    // 收集起止范围内的被中断的事务
+    val abortedTransactions = log.collectAbortedTransactions(start, end)
+    // 由abortedTransactions生成CleanedTransactionMetadata用于追踪压缩清理日志过程中事务的状态
+    // CleanedTransactionMetadata由abortedTransactions，及对应的事务index初始化，
+    // 在日志压缩清理过程中，事务的状态会发生变化。
+    //CleanedTransactionMetadata决定什么时候删除事务标记和相应地更新事务索引
+    val transactionMetadata = CleanedTransactionMetadata(abortedTransactions)
+
+    // full用于标识offset是否已经满，满的标准是map.slot * factor
+    // full 为true时，则终止了下面的for循环
+    var full = false 
+    for (segment <- dirty if !full) {
+      // 判断TopicPartition对应的日志有没有被标记为LogCleaningAborted
+      // 如果是，则这里会抛出异常
+      checkDone(log.topicPartition)
+
+      // 逐个Segment的消息加入offset map中
+      full = buildOffsetMapForSegment(log.topicPartition, segment, map, start, log.config.maxMessageSize,
+        transactionMetadata, stats)
+    }
+  }
+
+  // 单个Segment的消息加入offset map中
+  private def buildOffsetMapForSegment(topicPartition: TopicPartition,
+                                       segment: LogSegment,
+                                       map: OffsetMap,
+                                       startOffset: Long,
+                                       maxLogMessageSize: Int,
+                                       transactionMetadata: CleanedTransactionMetadata,
+                                       stats: CleanerStats): Boolean = {
+    // 获取开始读取的位置
+    var position = segment.offsetIndex.lookup(startOffset).position
+    // 是否已满，map如果已经定义为full,则这一轮的日志压缩清理工作就此结束
+    val maxDesiredMapSize = (map.slots * this.dupBufferLoadFactor).toInt
+    while (position < segment.log.sizeInBytes) {
+      // 再次判断TopicPartition对应的日志有没有被标记为LogCleaningAborted
+      // 如果是，则这里会抛出异常
+      checkDone(topicPartition)
+      readBuffer.clear()
+      try {
+        //读满buffer或者读到文件结束
+        segment.log.readInto(readBuffer, position)
+      } catch {
+        // 异常处理
+      }
+      val records = MemoryRecords.readableRecords(readBuffer)
+      throttler.maybeThrottle(records.sizeInBytes)
+
+      val startPosition = position
+      for (batch <- records.batches.asScala) {
+        if (batch.isControlBatch) {
+          // 更新事务状态， 如果该controlBatch可以丢弃则返回true
+          // 如果batch对应的type为abort, 且
+          transactionMetadata.onControlBatchRead(batch)
+          stats.indexMessagesRead(1)
+        } else {
+          val isAborted = transactionMetadata.onBatchRead(batch)
+          if (isAborted) {
+            // 如果是丢弃结果，则不修改map,只记录统计信息
+            stats.indexMessagesRead(batch.countOrNull)
+          } else {
+            // 不丢弃，则将batch中offset>startOffset消息逐条写入map中
+            for (record <- batch.asScala) {
+              if (record.hasKey && record.offset >= startOffset) {
+                if (map.size < maxDesiredMapSize)
+                  // map记录key和offset
+                  map.put(record.key, record.offset)
+                else
+                  return true
+              }
+              stats.indexMessagesRead(1)
+            }
+          }
+        }
+
+        // 修改map的LatestOffset，用于记录map清理到消息中的最大offset
+        if (batch.lastOffset >= startOffset)
+          map.updateLatestOffset(batch.lastOffset)
+      }
+      val bytesRead = records.validBytes
+      position += bytesRead
+      stats.indexBytesRead(bytesRead)
+
+      // 一条消息都没读到，扩大buffer
+      if(position == startPosition)
+        growBuffersOrFail(segment.log, position, maxLogMessageSize, records)
+    }
+    // 清理buffer
+    restoreBuffers()
+    false
+  }
+
+  // 压缩清理工作实际实现方法
+  private[log] def doClean(cleanable: LogToClean, deleteHorizonMs: Long): (Long, CleanerStats) = {
+
+    val log = cleanable.log
+    val stats = new CleanerStats()
+
+    // 第一条不能清理的offset作为清理的上界
+    val upperBoundOffset = cleanable.firstUncleanableOffset
+
+    // 本次可压缩清理部分的所有消息用于生成一个map,记录保留消息的key，和offset
+    buildOffsetMap(log, cleanable.firstDirtyOffset, upperBoundOffset, offsetMap, stats)
+    val endOffset = offsetMap.latestOffset + 1
+    stats.indexDone()
+
+    // determine the timestamp up to which the log will be cleaned
+    // this is the lower of the last active segment and the compaction lag
+    val cleanableHorizonMs = log.logSegments(0, cleanable.firstUncleanableOffset).lastOption.map(_.lastModified).getOrElse(0L)
+
+
+    // group the segments and clean the groups
+    info("Cleaning log %s (cleaning prior to %s, discarding tombstones prior to %s)...".format(log.name, new Date(cleanableHorizonMs), new Date(deleteHorizonMs)))
+    for (group <- groupSegmentsBySize(log.logSegments(0, endOffset), log.config.segmentSize, log.config.maxIndexSize, cleanable.firstUncleanableOffset))
+      cleanSegments(log, group, offsetMap, deleteHorizonMs, stats)
+
+    // record buffer utilization
+    stats.bufferUtilization = offsetMap.utilization
+
+    stats.allDone()
+
+    (endOffset, stats)
+  }
+
+  /**
+   * Clean a group of segments into a single replacement segment
+   *
+   * @param log The log being cleaned
+   * @param segments The group of segments being cleaned
+   * @param map The offset map to use for cleaning segments
+   * @param deleteHorizonMs The time to retain delete tombstones
+   * @param stats Collector for cleaning statistics
+   */
+  private[log] def cleanSegments(log: Log,
+                                 segments: Seq[LogSegment],
+                                 map: OffsetMap,
+                                 deleteHorizonMs: Long,
+                                 stats: CleanerStats) {
+
+    def deleteCleanedFileIfExists(file: File): Unit = {
+      Files.deleteIfExists(new File(file.getPath + Log.CleanedFileSuffix).toPath)
+    }
+
+    // create a new segment with a suffix appended to the name of the log and indexes
+    val firstSegment = segments.head
+    deleteCleanedFileIfExists(firstSegment.log.file)
+    deleteCleanedFileIfExists(firstSegment.offsetIndex.file)
+    deleteCleanedFileIfExists(firstSegment.timeIndex.file)
+    deleteCleanedFileIfExists(firstSegment.txnIndex.file)
+
+    val baseOffset = firstSegment.baseOffset
+    val cleaned = LogSegment.open(log.dir, baseOffset, log.config, time, fileSuffix = Log.CleanedFileSuffix,
+      initFileSize = log.initFileSize, preallocate = log.config.preallocate)
+
+    try {
+      // clean segments into the new destination segment
+      val iter = segments.iterator
+      var currentSegmentOpt: Option[LogSegment] = Some(iter.next())
+      while (currentSegmentOpt.isDefined) {
+        val currentSegment = currentSegmentOpt.get
+        val nextSegmentOpt = if (iter.hasNext) Some(iter.next()) else None
+
+        val startOffset = currentSegment.baseOffset
+        val upperBoundOffset = nextSegmentOpt.map(_.baseOffset).getOrElse(map.latestOffset + 1)
+        val abortedTransactions = log.collectAbortedTransactions(startOffset, upperBoundOffset)
+        val transactionMetadata = CleanedTransactionMetadata(abortedTransactions, Some(cleaned.txnIndex))
+
+        val retainDeletes = currentSegment.lastModified > deleteHorizonMs
+        info(s"Cleaning segment $startOffset in log ${log.name} (largest timestamp ${new Date(currentSegment.largestTimestamp)}) " +
+          s"into ${cleaned.baseOffset}, ${if(retainDeletes) "retaining" else "discarding"} deletes.")
+        cleanInto(log.topicPartition, currentSegment.log, cleaned, map, retainDeletes, log.config.maxMessageSize,
+          transactionMetadata, log.activeProducersWithLastSequence, stats)
+
+        currentSegmentOpt = nextSegmentOpt
+      }
+
+      cleaned.onBecomeInactiveSegment()
+      // flush new segment to disk before swap
+      cleaned.flush()
+
+      // update the modification date to retain the last modified date of the original files
+      val modified = segments.last.lastModified
+      cleaned.lastModified = modified
+
+      // swap in new segment
+      info(s"Swapping in cleaned segment ${cleaned.baseOffset} for segment(s) ${segments.map(_.baseOffset).mkString(",")} " +
+        s"in log ${log.name}")
+      log.replaceSegments(cleaned, segments)
+    } catch {
+      case e: LogCleaningAbortedException =>
+        try cleaned.deleteIfExists()
+        catch {
+          case deleteException: Exception =>
+            e.addSuppressed(deleteException)
+        } finally throw e
+    }
+  }
 ```
 
 
