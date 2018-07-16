@@ -14,7 +14,7 @@ title: Kafka 副本间的主从同步
 
 ## <a id="KafkaController">KafkaController</a>
 
-　　Controller是Kafka的一个重要的组件，用于集群中的meta信息的管理。Controller的具体作用从KafkaController.onControllerFailover()方法中祖册的监听事件可以看出来:
+　　Controller是Kafka的一个重要的组件，用于集群中的meta信息的管理。Controller的具体作用从KafkaController.onControllerFailover()方法中注册的监听事件可以看出来:
 
 ```scala
     private def onControllerFailover() {
