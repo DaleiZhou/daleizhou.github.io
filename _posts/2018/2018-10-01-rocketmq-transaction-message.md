@@ -9,10 +9,10 @@ title: RocketMQ事务消息分析(一)
 
   代码版本: 4.3.0
 
-　　RocketMQ-4.3.0的一个重要更新是对事务型消息的支持[ISSUE-292](https://github.com/apache/rocketmq/issues/292).因为事务消息的一些基础设施在以前的版本里已经部分支持，这里不局限于这次更新的代码，而是直接给出一个全貌的解析。
+　　RocketMQ-4.3.0的一个重要更新是对事务型消息的支持[ISSUE-292](https://github.com/apache/rocketmq/issues/292).因为事务消息的一些基础设施在以前的版本里已经部分支持，这里不局限于这次更新的代码，而是直接给出一个全貌的解析。RocketMQ的网络模型，消息存储，index过程等其它细节暂时不详细展开，后面会有专门的篇幅来系统的介绍。这里直接只对事务消息的处理部分做简要的分析，来学习RocketMQ事务消息实现的原理思想和处理手法。
 
 
-## <a id="Produce transaction message">Producer发送事务消息</a>
+## <a id="Produce transaction message">0 Producer发送事务消息</a>
 　　我们从example包提供的例子看起, 如下面的代码片段:
 
 ```java
@@ -45,7 +45,7 @@ title: RocketMQ事务消息分析(一)
 
         SendResult sendResult = null;
 
-        // 2. 给消息设置Half属性
+        // 2. 给消息设置Half属性, 用于后续broker接收到消息判断是否是事务消息的prepare
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_TRANSACTION_PREPARED, "true");
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.defaultMQProducer.getProducerGroup());
         try {
@@ -143,8 +143,80 @@ title: RocketMQ事务消息分析(一)
     }
 ```
 
+## <a id="PutMessage">Broker PutMessage</a>
 
-# TODO
+　　接下来我们看Broker端对事务消息的处理过程。Broker端在对事务消息请求的网络处理流程上与其他消息处理过程并无区别。从**SendMEssageProcessor.sendMessage()**开始有差异的处理。RocketMQ处理**produce**请求的基本套路是将客户端请求包装成内部消息，并根据requestHeader设置各种成员变量的值, 内部消息最后被处理存储到CommitLog中。
+
+
+```java
+	// SendMEssageProcessor.java
+	private RemotingCommand sendMessage(final ChannelHandlerContext ctx,
+                                        final RemotingCommand request,
+                                        final SendMessageContext sendMessageContext,
+                                        final SendMessageRequestHeader requestHeader) throws RemotingCommandException {
+		// other code ...
+
+		// 根据请求数据，生成内部消息用于后续存储在CommitLog中
+		MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+
+		// handleRetryAndDLQ， 其中特别重要的是在这个方法中会设置msgInner的SystemFlag
+		// SystemFlag由客户端放在RequestHeader中传过来，在事务消息发送存储过程中用于区分消息类型
+		// prepare阶段客户端设置成 MessageSysFlag.TRANSACTION_PREPARED_TYPE
+        if (!handleRetryAndDLQ(requestHeader, response, request, msgInner, topicConfig)) {
+            return response;
+        }
+		
+		//客户端发送事务消息时设置PROPERTY_TRANSACTION_PREPARED为true
+		String traFlag = oriProps.get(MessageConst.PROPERTY_TRANSACTION_PREPARED);
+        if (traFlag != null && Boolean.parseBoolean(traFlag)) {
+        	// broker端配置rejectTransactionMessage用于是否接受事务消息
+            if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
+                response.setCode(ResponseCode.NO_PERMISSION);
+                response.setRemark(
+                    "the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1()
+                        + "] sending transaction message is forbidden");
+                return response;
+            }
+
+            // 处理事务消息
+            putMessageResult = this.brokerController.getTransactionalMessageService().prepareMessage(msgInner);
+        } else {
+            putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
+        }
+
+        return handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt);
+    }
+
+```
+
+　　**SendMEssageProcessor.sendMessage()**处理过程中会调用私有方法handleRetryAndDLQ()来进行消息重试的相关处理，该方法中会将RequestHeader中传过来的SystemFlag的值设置到内部消息中。在发送事务消息这个场景下，该标识的值会被设置成**MessageSysFlag.TRANSACTION_PREPARED_TYPE**。客户端发送事务消息是有个附加的属性**MessageConst.PROPERTY_TRANSACTION_PREPARED**会被设置为true,因此会走第一个**if**分支。在该分支中我们可以看到**broker**可以配置是否接受事务消息。假如**Broker**端可以处理事务消息，则通过Broker启动时设置的TransactionalMessageService进行事务消息的处理。
+
+　　跟踪代码可以看到内部消息通过**TransactionalMessageBridge.parseHalfMessageInner()**进行处理。处理过程中保存原消息的Topic及queueId，并且重设消息的SystemFlag,Topic和QueueId。该处理的目的很明确，重置是为了无差别保存内部消息到CommitLog中，但不对原Topic的消费组可见。保存一些信息的目的是为了等commit/abort阶段取出half消息存储到原目的消息队列中。
+
+
+```java
+	// TransactionalMessageBridge.java
+
+	public PutMessageResult putHalfMessage(MessageExtBrokerInner messageInner) {
+        return store.putMessage(parseHalfMessageInner(messageInner));
+    }
+
+    private MessageExtBrokerInner parseHalfMessageInner(MessageExtBrokerInner msgInner) {
+        MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_TOPIC, msgInner.getTopic());
+        MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_QUEUE_ID,
+            String.valueOf(msgInner.getQueueId()));
+        msgInner.setSysFlag(
+            MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), MessageSysFlag.TRANSACTION_NOT_TYPE));
+        msgInner.setTopic(TransactionalMessageUtil.buildHalfTopic());
+        msgInner.setQueueId(0);
+        msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgInner.getProperties()));
+        return msgInner;
+    }
+```
+
+　　
+## <a id="Check">Check</a>
+### TODO: prepare消息发送成功但是久未commit/rollback
 
 ## <a id="references">References</a>
 
