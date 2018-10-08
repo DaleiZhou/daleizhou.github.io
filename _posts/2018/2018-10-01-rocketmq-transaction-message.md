@@ -549,11 +549,13 @@ public void check(long transactionTimeout, int transactionCheckMax,
     }
 ```
 
-　　如上述在**check()**方法中添加的说明注释描述的那样，check过程定时对每个Half消息队列依次处理。对于每个Half消息队列，从对应的op
+　　如上述在**check()**方法中添加的说明注释描述的那样，check过程定时对每个Half消息队列依次处理。对于每个Half消息队列，从对应的op队列中拉取一些消息，逐个对这些消息进行处理。处理过程中维护removeMap,凡是在这个缓存中的都是确定要删除的数据，因此half队列中有吻合的消息则就跳过不进行处理。如果一个消息被检查过多次或消息太旧，旧到超过了RocketMQ保存消息最长时限，则也需要跳过消息。**Check**具体执行过程是向客户端发送一个CheckTransactionState请求，包含了消息id,事务id等信息。客户端根据这些信息决定提交EndTransaction的请求。这样因为一些原因Broker上没有正确收到EndTransaction请求的事务消息可以得到最终的commit/abort。
+
+　　RocketMQ在逐个消息检查过程中并不阻塞等待。而是将那些后续需要检查的消息重新追加到消息队列的尾部，而正常的移动消费的offset。在每个队列检查过程中，处理持续的时间不能过长，如果过长则切换下一个队列进行处理。如果该队列处理的太早也需要让出时间，切换到别的队列。
 
 ## <a id="conclusion">Conclusion</a>
 
-　　
+　　至此，RocketMQ事务消息的提交、Broker的处理及容错check部分都分析完毕。RocketMQ对事务处理的基本思路放入一个half消息队列中暂存起来，直到客户端发送commit请求才最终写到目标Topic对应的消息队列中。从Half消息队列中删除没用的消息也只是写入一个Op消息到Op消息队列中。利用后台check线程逐一对Half中的消息进行内部消费，如果是属于已经写入删除Op的Half消息则跳过，如果是那些悬而未决的消息则进行check处理，check处理的目的是Broker对没有正常收到End请求的事务消息的一种容错处理，向客户端发送check请求，通知客户端进行处理，如再次提交等。在实现过程中，RocketMQ还会将需要延迟处理的消息重新追加到Half消息队尾，这样会在未来的时间片中进行处理。
 
 ## <a id="references">References</a>
 
