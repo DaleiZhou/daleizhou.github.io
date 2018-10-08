@@ -19,4 +19,4 @@ title: RocketMQ存储实现分析
 
 ## <a id="references">References</a>
 
-*https://daleizhou.github.io/posts/log-fetch-produce.html
+* https://daleizhou.github.io/posts/log-fetch-produce.html
