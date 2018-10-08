@@ -1,7 +1,7 @@
 ---
 layout: post
 category: RocketMQ
-title: RocketMQ事务消息分析(一)
+title: RocketMQ事务消息分析
 ---
 
 ## 内容 
@@ -12,7 +12,7 @@ title: RocketMQ事务消息分析(一)
 　　RocketMQ-4.3.0的一个重要更新是对事务型消息的支持[ISSUE-292](https://github.com/apache/rocketmq/issues/292).因为事务消息的一些基础设施在以前的版本里已经部分支持，这里不局限于这次更新的代码，而是直接给出一个全貌的解析。RocketMQ的网络模型，消息存储，index过程等其它细节暂时不详细展开，后面会有专门的篇幅来系统的介绍。这里直接只对事务消息的处理部分做简要的分析，来学习RocketMQ事务消息实现的原理思想和处理手法。
 
 
-## <a id="Produce transaction message">0 Producer发送事务消息</a>
+## <a id="Produce transaction message">Producer发送事务消息</a>
 　　我们从example包提供的例子看起, 如下面的代码片段:
 
 ```java
@@ -191,8 +191,7 @@ title: RocketMQ事务消息分析(一)
 
 　　**SendMEssageProcessor.sendMessage()**处理过程中会调用私有方法handleRetryAndDLQ()来进行消息重试的相关处理，该方法中会将RequestHeader中传过来的SystemFlag的值设置到内部消息中。在发送事务消息这个场景下，该标识的值会被设置成**MessageSysFlag.TRANSACTION_PREPARED_TYPE**。客户端发送事务消息是有个附加的属性**MessageConst.PROPERTY_TRANSACTION_PREPARED**会被设置为true,因此会走第一个**if**分支。在该分支中我们可以看到**broker**可以配置是否接受事务消息。假如**Broker**端可以处理事务消息，则通过Broker启动时设置的TransactionalMessageService进行事务消息的处理。
 
-　　跟踪代码可以看到内部消息通过**TransactionalMessageBridge.parseHalfMessageInner()**进行处理。处理过程中保存原消息的Topic及queueId，并且重设消息的SystemFlag,Topic和QueueId。该处理的目的很明确，重置是为了无差别保存内部消息到CommitLog中，但不对原Topic的消费组可见。保存一些信息的目的是为了等commit/abort阶段取出half消息存储到原目的消息队列中。
-
+　　跟踪代码可以看到内部消息通过**TransactionalMessageBridge.parseHalfMessageInner()**进行处理。处理过程中保存原消息的Topic及queueId，并且重设消息的SystemFlag,Topic和QueueId。该处理的目的很明确，重置是为了无差别保存内部消息到CommitLog中，但不对原Topic的消费组可见。保存一些信息的目的是为了等commit/abort阶段取出half消息存储到原目的消息队列中。**parseHalfMessageInner()**方法处理完毕后通过调用store.putMessage()进行保存half消息。
 
 ```java
 	// TransactionalMessageBridge.java
@@ -205,8 +204,10 @@ title: RocketMQ事务消息分析(一)
         MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_TOPIC, msgInner.getTopic());
         MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_QUEUE_ID,
             String.valueOf(msgInner.getQueueId()));
+        // 重置事务标识，后续的IndexService和
         msgInner.setSysFlag(
             MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), MessageSysFlag.TRANSACTION_NOT_TYPE));
+        // 设置内部消息的Topic为MixAll.RMQ_SYS_TRANS_HALF_TOPIC对应的值
         msgInner.setTopic(TransactionalMessageUtil.buildHalfTopic());
         msgInner.setQueueId(0);
         msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgInner.getProperties()));
@@ -214,9 +215,178 @@ title: RocketMQ事务消息分析(一)
     }
 ```
 
-　　
+　　RocketMQ在设计上讲所有消息都存储在CommitLog中,在Broker启动时启动**CommitLogDispatcherBuildIndex**和**CommitLogDispatcherBuildConsumeQueue**, 分别用于在后台不断地将CommitLog中新加入的消息进行Index和更新不同Topic的队列的ConsumerQueue。具体细节我们将会在专门分析RocketMQ的存储部分来描述。这里我们只用知道在前述的两个**CommitLogDispatcher**的**dispatch()**方法中，因为之前描述的内部消息的SysFlag被重置为**TRANSACTION_NOT_TYPE**的缘故，不仅后台线程会进行BuildIndex，而且会更新Half消息对应的MessageQueue的内容。
+
+## <a id="EndTransaction">EndTransaction</a>
+
+　　Prepare阶段发送的消息成功被转化为Half消息存储在Broker上之后给客户端返回操作成功结果。如第一节描述，客户端在接收到成功的结果后，执行预设的TransactionListener.executeLocalTransaction逻辑，用于获取是否commit/rollback已发送的prepare消息。根据localTransactionState不同，发送EndTransactionRequestHeader进行事务的第二阶段。
+
+```java
+// DefaultMQProducerImpl.java
+public void endTransaction(
+        final SendResult sendResult,
+        final LocalTransactionState localTransactionState,
+        final Throwable localException) throws RemotingException, MQBrokerException, InterruptedException, UnknownHostException {
+        final MessageId id;
+        // 从发送的结果中获取消息在CommitLog中断额Offset
+        // 该offset后续会回传给Borker，让Borker知道去处理哪一个half消息
+        if (sendResult.getOffsetMsgId() != null) {
+            id = MessageDecoder.decodeMessageId(sendResult.getOffsetMsgId());
+        } else {
+            id = MessageDecoder.decodeMessageId(sendResult.getMsgId());
+        }
+        String transactionId = sendResult.getTransactionId();
+        final String brokerAddr = this.mQClientFactory.findBrokerAddressInPublish(sendResult.getMessageQueue().getBrokerName());
+        EndTransactionRequestHeader requestHeader = new EndTransactionRequestHeader();
+        requestHeader.setTransactionId(transactionId);
+        // Broker会根据该Offset在Commit/abort阶段取出half消息进行处理
+        requestHeader.setCommitLogOffset(id.getOffset());
+        switch (localTransactionState) {
+            case COMMIT_MESSAGE:
+                requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_COMMIT_TYPE);
+                break;
+            case ROLLBACK_MESSAGE:
+                requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_ROLLBACK_TYPE);
+                break;
+            case UNKNOW:
+                requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_NOT_TYPE);
+                break;
+            default:
+                break;
+        }
+
+        requestHeader.setProducerGroup(this.defaultMQProducer.getProducerGroup());
+        requestHeader.setTranStateTableOffset(sendResult.getQueueOffset());
+        requestHeader.setMsgId(sendResult.getMsgId());
+        String remark = localException != null ? ("executeLocalTransactionBranch exception: " + localException.toString()) : null;
+        // 通过OneWay的方式发送EndTransactionRequest
+        this.mQClientFactory.getMQClientAPIImpl().endTransactionOneway(brokerAddr, requestHeader, remark,
+            this.defaultMQProducer.getSendMsgTimeout());
+    }
+```
+
+　　**DefaultMQProducerImpl.endTransaction()**方法里从Broker返回的结果中取出消息Offset,transactionId，连同**localTransactionState**来生成**EndTransactionRequestHeader**，用于Commit/abort本次提交的事务消息。Offset为第一阶段存入的Half消息在CommitLog中的Offset,第二阶段Borker会通过该Offset取出half消息进行处理。这里请求使用OneWay方式进行提交而不关心结果，即便是请求没有得到正确处理，后续也会有Check机制来补偿。
+
+　　下面来看**Broker**接收到**EndTransactionRequest**后的处理。在Commit/abort的处理过程基本相同，大致过程是调用**TransactionalMessageService**进行commit/rollback**消息。虽然调用的方法不同，但是都是根据客户端传入的Offset取出之前存入的Half消息，如果是Commit类型则会将取出的消息进行一些成员设置用于存入实际的Topic对应的实际消息队列中。最后都进将Half消息从Half消息队列中删除，操作成功之后给客户端返回结果，不过因为客户端是通过**Oneway**方式调用，因此结果返回显得可能就不那么重要。当然这里的删除实际并不会执行删除操作，而是一种说法，具体实现如下。
+
+```java
+// EndTransactionProcessor.java
+public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) throws
+        RemotingCommandException {
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+        final EndTransactionRequestHeader requestHeader =
+            (EndTransactionRequestHeader)request.decodeCommandCustomHeader(EndTransactionRequestHeader.class);
+        LOGGER.info("Transaction request:{}", requestHeader);
+        // Slave不处理EndTransactionRequest
+        if (BrokerRole.SLAVE == brokerController.getMessageStoreConfig().getBrokerRole()) {
+            response.setCode(ResponseCode.SLAVE_NOT_AVAILABLE);
+            LOGGER.warn("Message store is slave mode, so end transaction is forbidden. ");
+            return response;
+        }
+
+
+        OperationResult result = new OperationResult();
+        // 处理TRANSACTION_COMMIT_TYPE类型的EndTransactionRequest
+        if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {
+            result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);
+            if (result.getResponseCode() == ResponseCode.SUCCESS) {
+                RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+                if (res.getCode() == ResponseCode.SUCCESS) {
+                	// 根据取出的Half消息生成内部消息，设置目标Topic,queueId，保存到目标消息队列中
+                    MessageExtBrokerInner msgInner = endMessageTransaction(result.getPrepareMessage());
+                    msgInner.setSysFlag(MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), requestHeader.getCommitOrRollback()));
+                    msgInner.setQueueOffset(requestHeader.getTranStateTableOffset());
+                    msgInner.setPreparedTransactionOffset(requestHeader.getCommitLogOffset());
+                    msgInner.setStoreTimestamp(result.getPrepareMessage().getStoreTimestamp());
+                    
+                    // 通过MessageStore().putMessage()将消息存入目标Topic的目标消息队列中
+                    RemotingCommand sendResult = sendFinalMessage(msgInner);
+                    if (sendResult.getCode() == ResponseCode.SUCCESS) {
+                    	// 操作成功删除half消息
+                        this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
+                    }
+                    return sendResult;
+                }
+                return res;
+            }
+        } else if (MessageSysFlag.TRANSACTION_ROLLBACK_TYPE == requestHeader.getCommitOrRollback()) {
+        	// 处理TRANSACTION_ROLLBACK_TYPE类型的EndTransactionRequest
+            result = this.brokerController.getTransactionalMessageService().rollbackMessage(requestHeader);
+            if (result.getResponseCode() == ResponseCode.SUCCESS) {
+                RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+                if (res.getCode() == ResponseCode.SUCCESS) {
+                	// 操作成功删除half消息
+                    this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
+                }
+                return res;
+            }
+        }
+        response.setCode(result.getResponseCode());
+        response.setRemark(result.getResponseRemark());
+        return response;
+    }
+```
+
+　　**Kafka**到**RocketMQ**吞吐量很大的一个重要原因是设计上将**Producer**产生的消息以追加的形式写在**Log**文件的末尾，这样简化写的过程，提高写的效率。上面的代码片段中有调用**deletePrepareMessage()**方法，目的是删除已经没用的Half消息，根据**RocketMQ**的设计，我们应该猜到不会从Log文件里直接删除过期的消息。这里我们详细看RocketMQ是具体怎么做的。
+
+```java
+// TransactionalMessageServiceImpl.java
+public boolean deletePrepareMessage(MessageExt msgExt) {
+	    // 删除消息其实是保存一个删除的Op消息
+        if (this.transactionalMessageBridge.putOpMessage(msgExt, TransactionalMessageUtil.REMOVETAG)) {
+            log.info("Transaction op message write successfully. messageId={}, queueId={} msgExt:{}", msgExt.getMsgId(), msgExt.getQueueId(), msgExt);
+            return true;
+        } else {
+            log.error("Transaction op message write failed. messageId is {}, queueId is {}", msgExt.getMsgId(), msgExt.getQueueId());
+            return false;
+        }
+    }
+```
+
+　　从**TransactionalMessageServiceImpl.deletePrepareMessage()**方法中可以看到RocketMQ所谓的删除Half消息的操作的实现是写入一个Op消息实现的。具体实现看**TransactionalMessageBridge.putOpMessage()**的代码片段。
+
+```java
+// TransactionalMessageBridge.java
+public boolean putOpMessage(MessageExt messageExt, String opType) {
+	// 生成一个MessageQueue，该MessageQueue重写了hashCode,equals方法，如果成员变量值相同，则会被认为是相等的关系。
+        MessageQueue messageQueue = new MessageQueue(messageExt.getTopic(),
+            this.brokerController.getBrokerConfig().getBrokerName(), messageExt.getQueueId());
+        if (TransactionalMessageUtil.REMOVETAG.equals(opType)) {
+            return addRemoveTagInTransactionOp(messageExt, messageQueue);
+        }
+        return true;
+    }
+
+    private boolean addRemoveTagInTransactionOp(MessageExt messageExt, MessageQueue messageQueue) {
+        Message message = new Message(TransactionalMessageUtil.buildOpTopic(), TransactionalMessageUtil.REMOVETAG,
+            String.valueOf(messageExt.getQueueOffset()).getBytes(TransactionalMessageUtil.charset));
+        writeOp(message, messageQueue);
+        return true;
+    }
+
+    private void writeOp(Message message, MessageQueue mq) {
+        MessageQueue opQueue;
+        if (opQueueMap.containsKey(mq)) {
+            opQueue = opQueueMap.get(mq);
+        } else {
+            opQueue = getOpQueueByHalf(mq);
+            MessageQueue oldQueue = opQueueMap.putIfAbsent(mq, opQueue);
+            if (oldQueue != null) {
+                opQueue = oldQueue;
+            }
+        }
+        if (opQueue == null) {
+            opQueue = new MessageQueue(TransactionalMessageUtil.buildOpTopic(), mq.getBrokerName(), mq.getQueueId());
+        }
+        putMessage(makeOpMessageInner(message, opQueue));
+    }
+```
+
+　　**TransactionalMessageBridge**里维护一个Map类型的缓存变量opMap，key为Topic+BrokerName+QueueId的组合，value为对应的OpQueue信息，同样也是记录了Topic+BrokerName+QueueId的组合。根据传入的Message信息及OpQueue的信息生成一个**OpMessageInner**，通过**MessageStore.putMessage()**服务写入**CommitLog**。后续的如Index,ConsumerOffset更新等和普通消息过程一致。
+
 ## <a id="Check">Check</a>
 ### TODO: prepare消息发送成功但是久未commit/rollback
+
 
 ## <a id="references">References</a>
 
