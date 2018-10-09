@@ -2,26 +2,24 @@
 layout: default
 title: DaleiZhou's Blog
 ---
-{% assign first_post = site.posts.first %}
-<div id="post">
-<h1> <a href = "{{ first_post.url }}">
-{{ first_post.title }}
-</a></h1>
 
-<div class="authoring">
-  {{ first_post.date | date: "%B %e, %Y" }}
-</div>
+<h1>DaleiZhou's Blog</h1>
+<br>
 <div style="line-height:180%;">
   作者：DaleiZhou <br>
   出处：<a href="{{ first_post.url }}">http://daleizhou.github.io{{ first_post.url }}</a><br>
   声明：本文采用以下协议进行授权： <a href="http://creativecommons.org/licenses/by-nc-nd/3.0/deed.zh">自由转载-非商用-非衍生-保持署名|Creative Commons BY-NC-ND 3.0</a> ，转载请注明作者及出处。<br><br>
-</div>
-{{ first_post.content }}
-</div>
 
-<h1> Newest 10 Posts </h1>
-<ul class="posts">
-  {% for post in site.posts limit:10 %}
-  <li><span class="post_date">{{ post.date | date: "%B %e, %Y" }}</span> &raquo; <a href="{{ post.url }}">{{ post.title }}</a></li>
-  {% endfor %}
-</ul>
+<h2> Newest 5 Posts </h2>
+<br>
+ {% for post in site.posts limit:5 %}
+
+<div>
+<h3>{{ post.title }}</h3>
+<h5>{{ post.date | date: "%B %e, %Y" }}</h5>
+<br/>
+<div class="content">{{ post.excerpt | strip_html }}</div>
+<h3><a href='{{ post.url }}' title='Read more...'>Read more...</a></h3>
+<br/>
+
+ {% endfor %}

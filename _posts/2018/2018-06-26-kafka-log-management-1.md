@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Log Management(一)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -10,6 +11,7 @@ title: Kafka Log Management(一)
   代码版本: 2.0.0-SNAPSHOT
 
 　　在[Kafka log的读写分析](https://daleizhou.github.io/posts/log-fetch-produce.html)一文中有介绍过Kafka日志的结构，并提及Kafka会定期清理Segment。本文来具体看一下后台线程是如何完成清理工作，除此之外还一并涉及Kafka日志管理的其它内容，如：日志刷新，日志检查点设置等管理工作。因为功能点比较多，拆成两篇进行撰写。
+<!--more-->
 
 ## <a id="StartUp">StartUp</a>
 

@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Consumer(二)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -12,6 +13,7 @@ title: Kafka Consumer(二)
 　　本篇任然从KafkaConsumer.pollOnce()为切入点，学习一下consumer加入一个group之后消费具体的消息背后的实现细节，介绍包含客户端与服务端的代码细节。
 
 ## <a id="KafkaConsumer">KafkaConsumer</a>
+<!--more-->
 
 　　客户端拉取消息的入口是KafkaConsumer.poll(),该方法在过期时间内轮询拉取数据，如果并每次都检查条件，看是否需要更新缓存信息。下面我们看具体的一次轮询拉取消息的具体过程:
 

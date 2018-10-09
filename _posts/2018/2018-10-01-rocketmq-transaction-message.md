@@ -2,6 +2,7 @@
 layout: post
 category: RocketMQ
 title: RocketMQ事务消息分析
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -10,7 +11,7 @@ title: RocketMQ事务消息分析
   代码版本: 4.3.0
 
 　　RocketMQ-4.3.0的一个重要更新是对事务型消息的支持[ISSUE-292](https://github.com/apache/rocketmq/issues/292).因为事务消息的一些基础设施在以前的版本里已经部分支持，这里不局限于这次更新的代码，而是直接给出一个全貌的解析。RocketMQ的网络模型，消息存储，index过程等其它细节暂时不详细展开，后面会有专门的篇幅来系统的介绍。这里直接只对事务消息的处理部分做简要的分析，来学习RocketMQ事务消息实现的原理思想和处理手法。
-
+<!--more-->
 
 ## <a id="Produce transaction message">Producer发送事务消息</a>
 　　我们从example包提供的例子看起, 如下面的代码片段:

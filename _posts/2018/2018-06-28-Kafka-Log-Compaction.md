@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Log Compaction
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -14,6 +15,7 @@ title: Kafka Log Compaction
 ## <a id="summary">简介</a>
 
 　　Kafka在设计上，新的数据是往顺序日志文件中添加来写入，只往日志末尾进行append操作，这种设计可以带来很好的写入性能，在写入时不需要进行查询操作。对于同一个key,后续如果客户端更新了它对应的value，Kakfa保留对应所有版本的旧的数据值，而不直接修改替换相同key对应的value。为了让客户端在某个时刻获取最新版本的值，Kafka在后台会有压缩线程，定期进行日志的压缩清理工作。跟着官方文档我们来看一下具体的工作过程。
+<!--more-->
 
 <div align="center">
 <img src="/assets/img/2018/06/28/LogCompaction.jpeg" width="60%" height="60%"/>

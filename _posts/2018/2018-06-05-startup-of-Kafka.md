@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka事务消息过程分析(一)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -10,6 +11,7 @@ title: Kafka事务消息过程分析(一)
   代码版本: 2.0.0-SNAPSHOT
 
 　　Kafka从0.11.0.0包含两个比较大的特性，exactly once delivery和transactional transactional messaging。从消息的生产端保证了跨session的事务消息投递。这里计划从源码实现的角度跟踪分析，因为源码贴的太多，分大概三到四篇来说明。这里是第一篇：事务的初始化。
+<!--more-->
 
 ## <a id="baseApi">基本调用</a>
 

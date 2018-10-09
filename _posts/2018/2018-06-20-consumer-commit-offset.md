@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Consumer(三)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -10,6 +11,7 @@ title: Kafka Consumer(三)
   代码版本: 2.0.0-SNAPSHOT
 
 　　在[Kafka Consumer(一)](https://daleizhou.github.io/posts/consumer-subscribe.html)中介绍到通过KafkaConsumer.pollOnce()获取结果前会调用coordinator.poll()方法，在该方法中完成Coordinator,加入group等操作，该方法在最后还会调用maybeAutoCommitOffsetsAsync()来决定是否异步提交offset。本篇博文就从该方法讲起，追踪一下Offset的提交过程，算是对*Kafka Consumer*系列的补全。
+<!--more-->
 
 ## <a id="maybeAutoCommitOffsetsAsync">maybeAutoCommitOffsetsAsync</a>
 

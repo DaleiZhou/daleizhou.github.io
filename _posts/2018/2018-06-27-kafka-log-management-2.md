@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Log Management(二)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -10,6 +11,7 @@ title: Kafka Log Management(二)
   代码版本: 2.0.0-SNAPSHOT
 
 　　本文接着[Kafka Log Management(一)](https://daleizhou.github.io/posts/kafka-log-management-1.html)讲解LogManager剩下的三个日志管理的后台定时任务。
+<!--more-->
 
 ## <a id="CheckpointLogRecoveryOffsets">CheckpointLogRecoveryOffsets</a>
 

@@ -2,6 +2,7 @@
 layout: post
 category: Kafka
 title: Kafka Consumer(一)
+excerpt_separator: <!--more-->
 ---
 
 ## 内容 
@@ -12,6 +13,7 @@ title: Kafka Consumer(一)
 　　从这篇开始从KafkaConsumer为切入点，大概用两篇左右学习一下消息的消费相关的调用的实现，介绍包含客户端与服务端的代码细节。本篇涉及KafkaConsumer订阅主题，加入Group的具体实现。
 
 ## <a id="subscribe">subscribe</a>
+<!--more-->
 
 　　Kafka的subscribe()方法有两种订阅方法，一种是直接通过Topic进行调用，另一种是通过传入Pattern的方式进行主题的订阅。下面分别来介绍这两种。
 
