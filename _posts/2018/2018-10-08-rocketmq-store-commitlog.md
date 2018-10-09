@@ -17,6 +17,12 @@ excerpt_separator: <!--more-->
 
 ## <a id="CommitLog">CommitLog</a>
 
+　　这里，先根据源码我们抽象出如下的结构示意图，给读者一个宏观的印象，也方便后续的讲解说明。
+
+<div align="center">
+<img src="/assets/img/2018/10/08/RocketMQCommitLog.png" width="75%" height="75%"/>
+</div>
+
 
 
 ## <a id="references">References</a>
