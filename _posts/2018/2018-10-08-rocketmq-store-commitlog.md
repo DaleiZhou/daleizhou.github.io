@@ -94,6 +94,7 @@ excerpt_separator: <!--more-->
                     .getMapedFileSizeCommitLog()
                     &&
                     this.messageStore.getMessageStoreConfig().isWarmMapedFileEnable()) {
+                    // 文件预热
                     mappedFile.warmMappedFile(this.messageStore.getMessageStoreConfig().getFlushDiskType(),
                         this.messageStore.getMessageStoreConfig().getFlushLeastPagesWhenWarmMapedFile());
                 }
@@ -119,6 +120,7 @@ excerpt_separator: <!--more-->
             }
         } finally {
             if (req != null && isSuccess)
+                // 获取MappedFile的方法处会等待这个值进行同步
                 req.getCountDownLatch().countDown();
         }
         return true;
@@ -132,7 +134,7 @@ excerpt_separator: <!--more-->
     this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
 ```
 
-　　熟悉操作系统的同学都知道现在操作系统通过段页管理的手段，通过缺页中断的方式替换合适的内存页，讲缺失的内存页换到内存中，从而给每个用户进程可以提供突破物理内存大小限制的虚拟内存空间。而文件的内存映射初始化之后仅仅是建立了逻辑地址，并没有立即在实际的在物理内存中申请空间并将数据复制进来。因此，RocketMQ提供了MappedFile的`预热`的功能。
+　　熟悉操作系统的同学都知道现在操作系统通过段页管理的手段，通过缺页中断的方式替换合适的内存页，将缺失的内存页换到内存中，从而给每个用户进程可以提供突破物理内存大小限制的虚拟内存空间。而文件的内存映射初始化之后仅仅是建立了逻辑地址，并没有立即在实际的在物理内存中申请空间并将数据复制进来。因此，RocketMQ提供了MappedFile的`预热`的功能。
 
 ```java
     // MappedFile.java
@@ -176,7 +178,7 @@ excerpt_separator: <!--more-->
             mappedByteBuffer.force();
         }
 
-        // 通过jna讲内存页锁定在物理内存中，防止被放入swap分区
+        // 通过jna将内存页锁定在物理内存中，防止被放入swap分区
         this.mlock();
     }
 
@@ -200,13 +202,17 @@ excerpt_separator: <!--more-->
 
 　　**MappedFile.warmMappedFile()**方法即实现文件预热的功能，每个OS_PAGE写入一个任意值(这里为0)，也就是说在初始化状态下，这样操作会给每个页产生恰好一次的缺页中断，这样操作系统会分配物理内存并且将物理地址与逻辑地址简历映射关系。最后配合jna方法，传入mappedByteBuffer的地址及文件长度，告诉内核即将要访问这部分文件，希望能将这些页面都锁定在物理内存中，不换进行swapout [[2]](https://events.static.linuxfound.org/sites/events/files/lcjp13_moriya.pdf),从而在后续实际使用这个文件时提升读写性能。
 
+　　上面只是讲解了RocketMQ不间断地创建MappedFile的Loop过程，那么创建MappedFile的请求是什么时候放入请求队列的，为什么要通过这种异步创建的方式创建MappedFile呢，我们看下面的代码继续分析。
+
 ```java
     // AllocateMappedFileService.java
     public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
+        // 一次最多放两个请求
         int canSubmitRequests = 2;
+        // 如果TransientStorePoolEnable且角色不是SLAVE，如果pool中没有多余的空间则进行fast fail
         if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
             if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
-                && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) { //if broker is slave, don't fast fail even no buffer in pool
+                && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) {
                 canSubmitRequests = this.messageStore.getTransientStorePool().remainBufferNumbs() - this.requestQueue.size();
             }
         }
@@ -214,45 +220,47 @@ excerpt_separator: <!--more-->
         AllocateRequest nextReq = new AllocateRequest(nextFilePath, fileSize);
         boolean nextPutOK = this.requestTable.putIfAbsent(nextFilePath, nextReq) == null;
 
+        // 当且仅当requestTable中nextFilePath之前没有已经放入的请求
+        // 这里可能跳过，因为正常一次放两个请求，可能本次请求的path对应的MappedFile在之前的请求中已经生成了
         if (nextPutOK) {
+            // 初始化为2，如果TransientStorePoolEnable=true且角色不为SLAVE,该值会被调整为pool剩余的buffer数目
             if (canSubmitRequests <= 0) {
-                log.warn("[NOTIFYME]TransientStorePool is not enough, so create mapped file error, " +
-                    "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
+                // pool空间不足删除请求直接返回null
                 this.requestTable.remove(nextFilePath);
                 return null;
             }
             boolean offerOK = this.requestQueue.offer(nextReq);
-            if (!offerOK) {
-                log.warn("never expected here, add a request to preallocate queue failed");
-            }
+            if (!offerOK) { }
             canSubmitRequests--;
         }
 
+        // 处理过程和nextFilePath的处理一致
         AllocateRequest nextNextReq = new AllocateRequest(nextNextFilePath, fileSize);
         boolean nextNextPutOK = this.requestTable.putIfAbsent(nextNextFilePath, nextNextReq) == null;
         if (nextNextPutOK) {
             if (canSubmitRequests <= 0) {
-                log.warn("[NOTIFYME]TransientStorePool is not enough, so skip preallocate mapped file, " +
-                    "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
                 this.requestTable.remove(nextNextFilePath);
             } else {
                 boolean offerOK = this.requestQueue.offer(nextNextReq);
-                if (!offerOK) {
-                    log.warn("never expected here, add a request to preallocate queue failed");
-                }
+                if (!offerOK) { }
             }
         }
 
+        // 异步创建的Loop有异常，直接返回null
         if (hasException) {
             log.warn(this.getServiceName() + " service has exception. so return null");
             return null;
         }
 
+        // 
         AllocateRequest result = this.requestTable.get(nextFilePath);
         try {
             if (result != null) {
+                // 等待异步的Loop创建完成，通信号量将异步转同步等待
                 boolean waitOK = result.getCountDownLatch().await(waitTimeOut, TimeUnit.MILLISECONDS);
                 if (!waitOK) {
+                    // 假如超时则直接返回null, 蛋并没有从requestTable中删除请求
+                    // 因此在创建的Loop中会有一些检查操作
                     log.warn("create mmap timeout " + result.getFilePath() + " " + result.getFileSize());
                     return null;
                 } else {
@@ -269,6 +277,8 @@ excerpt_separator: <!--more-->
         return null;
     }
 ```
+
+　　这里是RocketMQ另一个实现上巧妙的地方了，之前代码分析过，创建MappedFile后台循环优先创建文件名小的请求。而通过阅读代码我们知道，每个MappedFile的文件名是根据上一个MappedFile的**FileFromOffset** + mappedFileSize得到的，代表该文件在CommitLog中的offset。因此文件名小的会被优先创建。每次申请获取MappedFile会创建一个冗余的创建请求。在方法结束时通过信号量等待机制将异步创建转为同步等结果。如果是已经通过之前的冗余请求创建完了，不仅本次创建请求得到满足，而且还会带来一个冗余的创建请求副作用。而这个副作用会被异步创建线程读取并进行创建但是不会阻塞调用获取的线程。等下次真的有请求获取这个结果可以很快的返回结果。
 
 ## <a id="FlushDisk">FlushDisk</a>
 
