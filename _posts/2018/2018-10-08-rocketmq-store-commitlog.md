@@ -31,7 +31,7 @@ excerpt_separator: <!--more-->
 
 ## <a id="AllocateMappedFileService">AllocateMappedFileService</a>
 
-　　在**AllocateMappedFileService.run()**中,如果没有外部线程将**stopped**变量置为true,则会不间断的执行私有方法**mmapOperation()**。该方法的作用是不断异步地从任务队列里取出请求生成对应的MappedFile，
+　　在**AllocateMappedFileService.run()**中,如果没有外部线程将**stopped**变量置为true,则会不间断的执行私有方法**mmapOperation()**。该方法的作用是不断异步地从任务队列里取出请求生成对应的MappedFile，用于AllocateMappedFileService提供的另一个获取MappedFild方法快速获取结果，下面看具体实现。
 
 ```java
     // AllocateMappedFileService.java
@@ -125,7 +125,14 @@ excerpt_separator: <!--more-->
     }
 ```
 
-　　RocketMQ提供两种刷盘方式：同步和异步。
+　　`MappedFile`之所以称为Mapped,是因为RocketMQ在实现持久化时，将CommitLog磁盘文件通过内存映射的方式进行操作。内存映射的方式直接将文件的内容复制到用户进程地址空间内，减少了用户态和内核态的切换及少了一次文件复制的成本。MappedFile是作为最终的物理文件的内存映射的一个类，RocketMQ通过该类进行读写操作，最终作用到物理文件上。都是通过如下的方式进行初始化。
+
+```java
+    this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
+    this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
+```
+
+　　熟悉操作系统的同学都知道现在操作系统通过段页管理的手段，通过缺页中断的方式替换合适的内存页，讲缺失的内存页换到内存中，从而给每个用户进程可以提供突破物理内存大小限制的虚拟内存空间。而文件的内存映射初始化之后仅仅是建立了逻辑地址，并没有立即在实际的在物理内存中申请空间并将数据复制进来。因此，RocketMQ提供了MappedFile的`预热`的功能。
 
 ```java
     // MappedFile.java
@@ -135,13 +142,15 @@ excerpt_separator: <!--more-->
         int flush = 0;
         long time = System.currentTimeMillis();
         // OS_PAGE_SIZE默认配置 1024 * 4
-        // fileSize默认配置 1024 * 1024 * 1024
-        // 每隔OS_PAGE_SIZE写入一个0进行warmup, 减少os缺页中断
+        // fileSize默认配置 1024 * 1024 * 1024 = 1G
+        // 每隔OS_PAGE_SIZE写入一个0进行warmup, 减少后面os缺页中断
         for (int i = 0, j = 0; i < this.fileSize; i += MappedFile.OS_PAGE_SIZE, j++) {
             byteBuffer.put(i, (byte) 0);
             // force flush when flush disk type is sync
             // pages 默认设置 = 1024 / 4 * 16
             if (type == FlushDiskType.SYNC_FLUSH) {
+
+                // 如果刷盘方式为同步刷盘，则每 pages 刷盘一次
                 if ((i / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE) >= pages) {
                     flush = i;
                     mappedByteBuffer.force();
@@ -160,19 +169,117 @@ excerpt_separator: <!--more-->
             }
         }
 
-        // force flush when prepare load finished
+        // 最后强制flush一次
         if (type == FlushDiskType.SYNC_FLUSH) {
             log.info("mapped file warm-up done, force to disk, mappedFile={}, costTime={}",
                 this.getFileName(), System.currentTimeMillis() - beginTime);
             mappedByteBuffer.force();
         }
-        log.info("mapped file warm-up done. mappedFile={}, costTime={}", this.getFileName(),
-            System.currentTimeMillis() - beginTime);
 
+        // 通过jna讲内存页锁定在物理内存中，防止被放入swap分区
         this.mlock();
+    }
+
+    // LibC继承自com.sun.jna.Library，通过jna方法访问一些native的系统调用
+    public void mlock() {
+        final long beginTime = System.currentTimeMillis();
+        final long address = ((DirectBuffer) (this.mappedByteBuffer)).address();
+        // jna
+        Pointer pointer = new Pointer(address);
+        {
+            int ret = LibC.INSTANCE.mlock(pointer, new NativeLong(this.fileSize));
+            log.info("mlock {} {} {} ret = {} time consuming = {}", address, this.fileName, this.fileSize, ret, System.currentTimeMillis() - beginTime);
+        }
+
+        {
+            int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
+            log.info("madvise {} {} {} ret = {} time consuming = {}", address, this.fileName, this.fileSize, ret, System.currentTimeMillis() - beginTime);
+        }
     }
 ```
 
-## <a id="references">References</a>
+　　**MappedFile.warmMappedFile()**方法即实现文件预热的功能，每个OS_PAGE写入一个任意值(这里为0)，也就是说在初始化状态下，这样操作会给每个页产生恰好一次的缺页中断，这样操作系统会分配物理内存并且将物理地址与逻辑地址简历映射关系。最后配合jna方法，传入mappedByteBuffer的地址及文件长度，告诉内核即将要访问这部分文件，希望能将这些页面都锁定在物理内存中，不换进行swapout [[2]](https://events.static.linuxfound.org/sites/events/files/lcjp13_moriya.pdf),从而在后续实际使用这个文件时提升读写性能。
 
-* https://daleizhou.github.io/posts/log-fetch-produce.html
+```java
+    // AllocateMappedFileService.java
+    public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
+        int canSubmitRequests = 2;
+        if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+            if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
+                && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) { //if broker is slave, don't fast fail even no buffer in pool
+                canSubmitRequests = this.messageStore.getTransientStorePool().remainBufferNumbs() - this.requestQueue.size();
+            }
+        }
+
+        AllocateRequest nextReq = new AllocateRequest(nextFilePath, fileSize);
+        boolean nextPutOK = this.requestTable.putIfAbsent(nextFilePath, nextReq) == null;
+
+        if (nextPutOK) {
+            if (canSubmitRequests <= 0) {
+                log.warn("[NOTIFYME]TransientStorePool is not enough, so create mapped file error, " +
+                    "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
+                this.requestTable.remove(nextFilePath);
+                return null;
+            }
+            boolean offerOK = this.requestQueue.offer(nextReq);
+            if (!offerOK) {
+                log.warn("never expected here, add a request to preallocate queue failed");
+            }
+            canSubmitRequests--;
+        }
+
+        AllocateRequest nextNextReq = new AllocateRequest(nextNextFilePath, fileSize);
+        boolean nextNextPutOK = this.requestTable.putIfAbsent(nextNextFilePath, nextNextReq) == null;
+        if (nextNextPutOK) {
+            if (canSubmitRequests <= 0) {
+                log.warn("[NOTIFYME]TransientStorePool is not enough, so skip preallocate mapped file, " +
+                    "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
+                this.requestTable.remove(nextNextFilePath);
+            } else {
+                boolean offerOK = this.requestQueue.offer(nextNextReq);
+                if (!offerOK) {
+                    log.warn("never expected here, add a request to preallocate queue failed");
+                }
+            }
+        }
+
+        if (hasException) {
+            log.warn(this.getServiceName() + " service has exception. so return null");
+            return null;
+        }
+
+        AllocateRequest result = this.requestTable.get(nextFilePath);
+        try {
+            if (result != null) {
+                boolean waitOK = result.getCountDownLatch().await(waitTimeOut, TimeUnit.MILLISECONDS);
+                if (!waitOK) {
+                    log.warn("create mmap timeout " + result.getFilePath() + " " + result.getFileSize());
+                    return null;
+                } else {
+                    this.requestTable.remove(nextFilePath);
+                    return result.getMappedFile();
+                }
+            } else {
+                log.error("find preallocate mmap failed, this never happen");
+            }
+        } catch (InterruptedException e) {
+            log.warn(this.getServiceName() + " service has exception. ", e);
+        }
+
+        return null;
+    }
+```
+
+## <a id="FlushDisk">FlushDisk</a>
+
+　　**Todo**: FlushDisk
+
+## <a id="CommitLogDispatcher">CommitLogDispatcher</a>
+
+　　**Todo**: CommitLogDispatcher
+
+## <a id="References">References</a>
+
+* [1] https://daleizhou.github.io/posts/log-fetch-produce.html
+
+* [2] https://events.static.linuxfound.org/sites/events/files/lcjp13_moriya.pdf
