@@ -68,7 +68,7 @@ excerpt_separator: <!--more-->
                 
                 // 两种生成MappedFile的方式
                 // isTransientStorePoolEnable设置为true且刷盘方式为异步刷盘
-                // TransientStorePool的使用是数据先写入堆内存，然后异步刷新到磁盘持久化
+                // TransientStorePool的使用是数据先写入堆外内存，然后异步刷新到磁盘持久化
                 if (messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
                     try {
                         // 通过ServiceLoader的方式起一个MappedFile并init初始化
@@ -133,6 +133,8 @@ excerpt_separator: <!--more-->
     this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
     this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
 ```
+
+　　如果`MessageStoreConfig().isTransientStorePoolEnable()`为true, 即Broker上transientStorePoolEnable==true,刷盘模式配置为异步刷盘且Broker的角色不为SLAVE这三个条件同时满足。这三个条件同时成立，这种条件下，MappedFile会借用TransientStorePool中的缓存缓存空间。如果是这种方法，Broker上的消息会先写入ByteBuffer.allocateDirect方式调用直接申请堆外内存中，由异步刷盘线程写入fileChannel中，最后进行flush。RocketMQ之所以这么实现是因为这种方案下写数据是完全写内存，速度相较于写文件对应的Page Cache更快[[3]](https://www.cnblogs.com/duanxz/p/4875020.html)，而且减少锁的占用，提升效率。不过在Broker出问题的情况下丢失的数据可能更多。
 
 　　熟悉操作系统的同学都知道现在操作系统通过段页管理的手段，通过缺页中断的方式替换合适的内存页，将缺失的内存页换到内存中，从而给每个用户进程可以提供突破物理内存大小限制的虚拟内存空间。而文件的内存映射初始化之后仅仅是建立了逻辑地址，并没有立即在实际的在物理内存中申请空间并将数据复制进来。因此，RocketMQ提供了MappedFile的`预热`的功能。
 
@@ -256,12 +258,11 @@ excerpt_separator: <!--more-->
         AllocateRequest result = this.requestTable.get(nextFilePath);
         try {
             if (result != null) {
-                // 等待异步的Loop创建完成，通信号量将异步转同步等待
+                // 等待异步的Loop创建完成，通计数栓将异步转同步等待
                 boolean waitOK = result.getCountDownLatch().await(waitTimeOut, TimeUnit.MILLISECONDS);
                 if (!waitOK) {
-                    // 假如超时则直接返回null, 蛋并没有从requestTable中删除请求
+                    // 假如超时则直接返回null, 但并没有从requestTable中删除请求
                     // 因此在创建的Loop中会有一些检查操作
-                    log.warn("create mmap timeout " + result.getFilePath() + " " + result.getFileSize());
                     return null;
                 } else {
                     this.requestTable.remove(nextFilePath);
@@ -278,11 +279,226 @@ excerpt_separator: <!--more-->
     }
 ```
 
-　　这里是RocketMQ另一个实现上巧妙的地方了，之前代码分析过，创建MappedFile后台循环优先创建文件名小的请求。而通过阅读代码我们知道，每个MappedFile的文件名是根据上一个MappedFile的**FileFromOffset** + mappedFileSize得到的，代表该文件在CommitLog中的offset。因此文件名小的会被优先创建。每次申请获取MappedFile会创建一个冗余的创建请求。在方法结束时通过信号量等待机制将异步创建转为同步等结果。如果是已经通过之前的冗余请求创建完了，不仅本次创建请求得到满足，而且还会带来一个冗余的创建请求副作用。而这个副作用会被异步创建线程读取并进行创建但是不会阻塞调用获取的线程。等下次真的有请求获取这个结果可以很快的返回结果。
+　　这里是RocketMQ另一个实现上巧妙的地方了，之前代码分析过，创建MappedFile后台循环优先创建文件名小的请求。而通过阅读代码我们知道，每个MappedFile的文件名是根据上一个MappedFile的**FileFromOffset** + mappedFileSize得到的，代表该文件在CommitLog中的offset。因此文件名小的会被优先创建。每次申请获取MappedFile会创建一个冗余的创建请求。在方法结束时通过计数栓等待机制将异步创建转为同步等结果。如果是已经通过之前的冗余请求创建完了，不仅本次创建请求得到满足，而且还会带来一个冗余的创建请求副作用。而这个副作用会被异步创建线程读取并进行创建但是不会阻塞调用获取的线程。等下次真的有请求获取这个结果可以很快的返回结果。
 
-## <a id="FlushDisk">FlushDisk</a>
+## <a id="Flush Disk">Flush Disk</a>
 
-　　**Todo**: FlushDisk
+　　RocketMQ相较于Kafka而言，在不仅提供异步刷盘的能力，同时还提供了可选的同步刷盘的能力。当然，RocketMQ中的同步刷盘也是通过异步线程实现，不过通过计数栓的阻塞等待将异步转同步，这种处理方法在RocketMQ中比较常见，例如前面章节的创建MappedFile也是通过这种方法同步得到结果。下面看两种刷盘方式的具体实现。
+
+```java
+    // CommitLog.java
+    public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
+        // other code ...
+
+        //在PutMessage调用的最后，进行刷盘处理
+        handleDiskFlush(result, putMessageResult, msg);
+        handleHA(result, putMessageResult, msg);
+
+        return putMessageResult;
+    }
+
+    public void handleDiskFlush(AppendMessageResult result, PutMessageResult putMessageResult, MessageExt messageExt) {
+        // 同步刷盘处理
+        if (FlushDiskType.SYNC_FLUSH == this.defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
+            // CommitLog初始化时，如果是SYNC_FLUSH方式刷盘，则flushCommitLogService的实现类为GroupCommitService
+            final GroupCommitService service = (GroupCommitService) this.flushCommitLogService;
+            // 消息中PROPERTY_WAIT_STORE_MSG_OK如果是true,则插入刷盘请求并同步等待刷盘结果
+            if (messageExt.isWaitStoreMsgOK()) {
+                GroupCommitRequest request = new GroupCommitRequest(result.getWroteOffset() + result.getWroteBytes());
+                service.putRequest(request);
+                boolean flushOK = request.waitForFlush(this.defaultMessageStore.getMessageStoreConfig().getSyncFlushTimeout());
+                // 如果同步等待countDownLatch.await
+                // 若超时还没返回结果，则设置put结果属性并返回，客户端会感知到
+                if (!flushOK) {
+                    log.error("do groupcommit, wait for flush failed, topic: " + messageExt.getTopic() + " tags: " + messageExt.getTags()
+                        + " client address: " + messageExt.getBornHostString());
+                    putMessageResult.setPutMessageStatus(PutMessageStatus.FLUSH_DISK_TIMEOUT);
+                }
+            } else {
+                service.wakeup();
+            }
+        }
+        // 两种异步刷盘，对应两种MappedFile生成方式
+        else {
+            if (!this.defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                flushCommitLogService.wakeup();
+            } else {
+                commitLogService.wakeup();
+            }
+        }
+    }
+```
+
+　　每次写完消息之后需要进行刷盘操作，Broker可以配置同步或者异步的刷盘方式，如果是同步刷盘则写完消息后需要等待刷盘结果，如果是异步刷盘，则不一定需要等待刷盘结果就进行下一步操作。两种处理手段各有特点，下面先看**GroupCommitService**中同步刷盘的实现过程。
+
+```java
+    //CommitLog#GroupCommitService.java
+
+    // 通过维护read,write两个列表，通过执行完一轮交换的方式读写互不干扰
+    private void swapRequests() {
+        List<GroupCommitRequest> tmp = this.requestsWrite;
+        this.requestsWrite = this.requestsRead;
+        this.requestsRead = tmp;
+    }
+
+    private void doCommit() {
+        synchronized (this.requestsRead) {
+            if (!this.requestsRead.isEmpty()) {
+                for (GroupCommitRequest req : this.requestsRead) {
+                    // 有可能req请求的offset在下一个MappedFile里，因此通过最多两轮循环取刷盘，
+                    // 如果消息在下一个MappedFile里，则第一次刷盘后MappedFileQueue#flushedWhere会更新，
+                    // 再一次通过MappedFileQueue#findMappedFileByOffset()获取到就是最新的MappedFile
+                    boolean flushOK = false;
+                    for (int i = 0; i < 2 && !flushOK; i++) {
+                        flushOK = CommitLog.this.mappedFileQueue.getFlushedWhere() >= req.getNextOffset();
+                        // 第一次刷盘后没有使得FlushedWhere大于请求的offset,则会第二次刷盘
+                        if (!flushOK) {
+                            CommitLog.this.mappedFileQueue.flush(0);
+                        }
+                    }
+                    // 通知同步等待结果的线程
+                    req.wakeupCustomer(flushOK);
+                }
+
+                this.requestsRead.clear();
+            } else {
+                // Because of individual messages is set to not sync flush, it
+                // will come to this process
+                CommitLog.this.mappedFileQueue.flush(0);
+            }
+        }
+    }
+
+    public void run() {
+        while (!this.isStopped()) {
+            try {
+                // waitForRunning()中如果hasNotified已经被设置为true,则直接交换read/write进行doCommit
+                // 正常最多等待10ms,然后交换read/write进行doCommit
+                this.waitForRunning(10);
+                this.doCommit();
+            } catch (Exception e) {
+                CommitLog.log.warn(this.getServiceName() + " service has exception. ", e);
+            }
+        }
+
+        // 关闭后休眠10ms再挣扎一把
+        try {
+            Thread.sleep(10);
+        } catch (InterruptedException e) {
+            CommitLog.log.warn("GroupCommitService Exception, ", e);
+        }
+        synchronized (this) { this.swapRequests(); }
+        this.doCommit();
+    }
+```
+
+　　下面说一下每次写入消息后异步刷盘处理过程。RocketMQ提供两种异步刷盘通过两种途径实现：**FlushRealTimeService**和**CommitRealTimeService**。其中CommitRealTimeService最终还是通过flushCommitLogService服务完成异步刷盘，这里先来看FlushRealTimeService的实现过程。
+
+```java
+    // CommitLog#FlushRealTimeService.java
+    public void run() {
+            while (!this.isStopped()) {
+                // 是否是定时flush, 默认为false即实时
+                boolean flushCommitLogTimed = CommitLog.this.defaultMessageStore.getMessageStoreConfig().isFlushCommitLogTimed();
+                // 调度flush时间间隔
+                int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushIntervalCommitLog();
+                // 至少有多少page没有flush才进行flush,如果为0，则意味着需要立马flush
+                int flushPhysicQueueLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogLeastPages();
+                int flushPhysicQueueThoroughInterval =
+                    CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogThoroughInterval();
+
+                boolean printFlushProgress = false;
+
+                // 如果上次flush执行已经超过flushPhysicQueueThoroughInterval，默认值为10s
+                // 如果条件成立，则打印进度并且将flushPhysicQueueLeastPages设置为0
+                // 以为不管缓存了多少都需要进行flush
+                long currentTimeMillis = System.currentTimeMillis();
+                if (currentTimeMillis >= (this.lastFlushTimestamp + flushPhysicQueueThoroughInterval)) {
+                    this.lastFlushTimestamp = currentTimeMillis;
+                    flushPhysicQueueLeastPages = 0;
+                    printFlushProgress = (printTimes++ % 10) == 0;
+                }
+
+                try {
+                    // 如果是是定时flush
+                    if (flushCommitLogTimed) {
+                        Thread.sleep(interval);
+                    } else {
+                        // 有调用weak或者等待超时都会进中断
+                        this.waitForRunning(interval);
+                    }
+
+                    if (printFlushProgress) {
+                        this.printFlushProgress();
+                    }
+
+                    long begin = System.currentTimeMillis();
+                    // flush
+                    CommitLog.this.mappedFileQueue.flush(flushPhysicQueueLeastPages);
+                    long storeTimestamp = CommitLog.this.mappedFileQueue.getStoreTimestamp();
+                    if (storeTimestamp > 0) {
+                        CommitLog.this.defaultMessageStore.getStoreCheckpoint().setPhysicMsgTimestamp(storeTimestamp);
+                    }
+                } catch (Throwable e) {
+                    this.printFlushProgress();
+                }
+            }
+
+            // 正常终止，flush所有缓存的数据
+            boolean result = false;
+            for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+                result = CommitLog.this.mappedFileQueue.flush(0);
+                CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+            }
+        }
+```
+
+　　如前文介绍MappedFile时所说`MessageStoreConfig().isTransientStorePoolEnable()`为true时，写消息时的数据是先写入堆外内存，因此这种条件下异步刷盘需要先将数据从堆外内存commit到fileChannel的page cache中，然后进行flush。
+
+
+```java
+    //CommitLog#CommitRealTimeService.java
+    public void run() {
+        CommitLog.log.info(this.getServiceName() + " service started");
+        while (!this.isStopped()) {
+            int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitIntervalCommitLog();
+
+            int commitDataLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogLeastPages();
+
+            int commitDataThoroughInterval =
+                CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogThoroughInterval();
+
+            long begin = System.currentTimeMillis();
+            if (begin >= (this.lastCommitTimestamp + commitDataThoroughInterval)) {
+                this.lastCommitTimestamp = begin;
+                commitDataLeastPages = 0;
+            }
+
+            try {
+                boolean result = CommitLog.this.mappedFileQueue.commit(commitDataLeastPages);
+                long end = System.currentTimeMillis();
+                if (!result) {
+                    this.lastCommitTimestamp = end; // result = false means some data committed.
+                    //now wake up flush thread.
+                    flushCommitLogService.wakeup();
+                }
+
+                if (end - begin > 500) {
+                    log.info("Commit data to file costs {} ms", end - begin);
+                }
+                this.waitForRunning(interval);
+            } catch (Throwable e) {
+                CommitLog.log.error(this.getServiceName() + " service has exception. ", e);
+            }
+        }
+
+        boolean result = false;
+        for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+            result = CommitLog.this.mappedFileQueue.commit(0);
+            CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+        }
+    }
+```
 
 ## <a id="CommitLogDispatcher">CommitLogDispatcher</a>
 
@@ -293,3 +509,5 @@ excerpt_separator: <!--more-->
 * [1] https://daleizhou.github.io/posts/log-fetch-produce.html
 
 * [2] https://events.static.linuxfound.org/sites/events/files/lcjp13_moriya.pdf
+
+* [3] https://www.cnblogs.com/duanxz/p/4875020.html
