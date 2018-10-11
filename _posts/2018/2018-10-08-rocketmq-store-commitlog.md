@@ -20,7 +20,7 @@ excerpt_separator: <!--more-->
 　　这里，先根据源码我们抽象出如下的结构示意图，给读者一个宏观的印象，也方便后续的讲解说明。
 
 <div align="center">
-<img src="/assets/img/2018/10/08/RocketMQCommitLog.png" width="75%" height="75%"/>
+<img src="/assets/img/2018/10/08/RocketMQCommitLog.png" width="90%" height="90%"/>
 </div>
 
 　　在`store`包里可以直接看到CommitLog的定义，CommitLog中有个重要的成员变量**MappedFileQueue**，该变量保存着MappedFile列表。MappedFile保存着最终的消息数据。在逻辑上CommitLog可以看成一个无限长的Log文件，消息不断通过追加的方式写到CommitLog的末尾。在实际实现时，这个无限长的日志文件由顺序的MappedFile列表组成，每个MappedFile则顺序保存一定数量的消息。
@@ -453,39 +453,29 @@ excerpt_separator: <!--more-->
         }
 ```
 
-　　如前文介绍MappedFile时所说`MessageStoreConfig().isTransientStorePoolEnable()`为true时，写消息时的数据是先写入堆外内存，因此这种条件下异步刷盘需要先将数据从堆外内存commit到fileChannel的page cache中，然后进行flush。
-
+　　如前文介绍MappedFile时所说`MessageStoreConfig().isTransientStorePoolEnable()`为true时，写消息时的数据是先写入堆外内存，因此这种条件下异步刷盘需要先将数据从堆外内存commit到fileChannel的Page Cache中，然后唤醒FlushRealTimeService进行flush。
 
 ```java
     //CommitLog#CommitRealTimeService.java
     public void run() {
-        CommitLog.log.info(this.getServiceName() + " service started");
         while (!this.isStopped()) {
-            int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitIntervalCommitLog();
-
-            int commitDataLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogLeastPages();
-
-            int commitDataThoroughInterval =
-                CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogThoroughInterval();
-
             long begin = System.currentTimeMillis();
+            // 时间太久需要立即commit
             if (begin >= (this.lastCommitTimestamp + commitDataThoroughInterval)) {
                 this.lastCommitTimestamp = begin;
                 commitDataLeastPages = 0;
             }
 
             try {
+                // 从堆外内存写到filechannel中
                 boolean result = CommitLog.this.mappedFileQueue.commit(commitDataLeastPages);
                 long end = System.currentTimeMillis();
                 if (!result) {
-                    this.lastCommitTimestamp = end; // result = false means some data committed.
-                    //now wake up flush thread.
+                    // result为false时则说明有数据提交
+                    // 唤醒flush线程，将数据从从page cache刷新到磁盘上
                     flushCommitLogService.wakeup();
                 }
 
-                if (end - begin > 500) {
-                    log.info("Commit data to file costs {} ms", end - begin);
-                }
                 this.waitForRunning(interval);
             } catch (Throwable e) {
                 CommitLog.log.error(this.getServiceName() + " service has exception. ", e);
@@ -502,7 +492,123 @@ excerpt_separator: <!--more-->
 
 ## <a id="CommitLogDispatcher">CommitLogDispatcher</a>
 
-　　**Todo**: CommitLogDispatcher
+　　回到一开始的问题，所有Topic的数据都通过追加的方式写到CommitLog末尾，那么Consumer如何通过Topic和Offset进行消息的消费呢。答案就是Broker启动之后，有名为**ReputMessageService**的后台线程不断的进行将新写入的数据更新**Index**和**ConsumeQueue**。Index的作用是通过Topic+Key与CommitLogOffset建立关联关系关系用于QueryMessageProcessor的消息消费。ConsumerQueue的作用是建立Queue+QueueOffset与CommitLogOffset之间的关联关系，用于通过PullMessageProcessor进行消费消息。下面来看具体的构建过程。
+
+```java
+    // IndexService.java
+    public void buildIndex(DispatchRequest req) {
+        // 最多尝试三次获取最后一个非空IndexFile,如果没有或者最后一个写满则生成一个新的
+        IndexFile indexFile = retryGetAndCreateIndexFile();
+        if (indexFile != null) {
+            long endPhyOffset = indexFile.getEndPhyOffset();
+            DispatchRequest msg = req;
+            String topic = msg.getTopic();
+            String keys = msg.getKeys();
+            // 旧的请求就会直接退出
+            if (msg.getCommitLogOffset() < endPhyOffset) {
+                return;
+            }
+
+            final int tranType = MessageSysFlag.getTransactionValue(msg.getSysFlag());
+            switch (tranType) {
+                // ...
+                // 剔除TRANSACTION_ROLLBACK_TYPE类型
+                case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                    return;
+            }
+
+            if (req.getUniqKey() != null) {
+
+                // 在IndexFile中写入Topic#UniqKey与CommitLogOffset的关联
+                indexFile = putKey(indexFile, msg, buildKey(topic, req.getUniqKey()));
+                // ...
+            }
+
+            if (keys != null && keys.length() > 0) {
+                // 每个key在IndexFile中写入Topic#Key与CommitLogOffset的关联 
+                String[] keyset = keys.split(MessageConst.KEY_SEPARATOR);
+                for (int i = 0; i < keyset.length; i++) {
+                    String key = keyset[i];
+                    if (key.length() > 0) {
+                        indexFile = putKey(indexFile, msg, buildKey(topic, key));
+                        // ...
+                    }
+                }
+            }
+        } else {
+            log.error("build index error, stop building index");
+        }
+    }
+
+```
+
+　　IndexFile与CommitLog相似，可以看成分段的无限长的Log的抽象。并且大小固定，写满则新生成一个继续写。IndexService通过调用IndexFile.putKey()方法不断地将Topic#Key与CommitLogOffset关联关系按照固定格式写到IndexFile文件中，不过写的过程中并不是简单的将记录写在尾部，而是还会对一些其他数据做出修改，使得文件内部结构类似于拉链的Hash表。对照博文开头的大图看具体写入过程。
+
+```java
+    // IndexFile.java
+    public boolean putKey(final String key, final long phyOffset, final long storeTimestamp) {
+        if (this.indexHeader.getIndexCount() < this.indexNum) {
+            int keyHash = indexKeyHashMethod(key);
+            // 根据key的hash取模获得槽的位置 hashSlotNum默认值为500w
+            int slotPos = keyHash % this.hashSlotNum;
+            int absSlotPos = IndexHeader.INDEX_HEADER_SIZE + slotPos * hashSlotSize;
+
+            FileLock fileLock = null;
+            try {
+                // 查看该槽内有多少记录，该记录数会写入本条index中用于逻辑上将这些记录串起来
+                int slotValue = this.mappedByteBuffer.getInt(absSlotPos);
+                if (slotValue <= invalidIndex || slotValue > this.indexHeader.getIndexCount()) {
+                    slotValue = invalidIndex;
+                }
+
+                long timeDiff = // timeDiff处理
+                // 计算在FileIndex中的偏移位置
+                // head(40B) + SlotTable大小(400w * 4B) + 已有记录数目*20B
+                int absIndexPos =
+                    IndexHeader.INDEX_HEADER_SIZE + this.hashSlotNum * hashSlotSize
+                        + this.indexHeader.getIndexCount() * indexSize;
+                // 写入记录
+                this.mappedByteBuffer.putInt(absIndexPos, keyHash);
+                this.mappedByteBuffer.putLong(absIndexPos + 4, phyOffset);
+                this.mappedByteBuffer.putInt(absIndexPos + 4 + 8, (int) timeDiff);
+                // 将本槽内已有记录数（不含本条）写入用于将记录串联
+                this.mappedByteBuffer.putInt(absIndexPos + 4 + 8 + 4, slotValue);
+
+                // 在槽内写入本条Index的位置信息
+                this.mappedByteBuffer.putInt(absSlotPos, this.indexHeader.getIndexCount());
+
+                if (this.indexHeader.getIndexCount() <= 1) {
+                    this.indexHeader.setBeginPhyOffset(phyOffset);
+                    this.indexHeader.setBeginTimestamp(storeTimestamp);
+                }
+
+                // 更新缓存
+                this.indexHeader.incHashSlotCount();
+                this.indexHeader.incIndexCount();
+                this.indexHeader.setEndPhyOffset(phyOffset);
+                this.indexHeader.setEndTimestamp(storeTimestamp);
+
+                return true;
+            } 
+
+            // other ...
+
+        return false;
+    }
+```
+
+　　ConsumeQueue的更新比较简单了，根据Topic和QueueId获取到ConsumeQueue。每一个ConsumeQueue也可以看成分段的无限长的AppendLog。更新记录时按顺序写入记录，记录固定是CommitLogOffset+MessageSize+TagCode,共20Byte。Consumer根据QueueId+QueueOffset读到一条记录按照里面信息再去CommitLog中读取数据进行消费。
+
+```java
+    public void putMessagePositionInfo(DispatchRequest dispatchRequest) {
+        ConsumeQueue cq = this.findConsumeQueue(dispatchRequest.getTopic(), dispatchRequest.getQueueId());
+        cq.putMessagePositionInfoWrapper(dispatchRequest);
+    }
+```
+
+## <a id="conclusion">Conclusion</a>
+
+　　到这里RocketMQ存储CommitLog及围绕在周边的一些后台任务和访问方法就介绍完了。RocketMQ为了实现高效的消息队列读写进行了一系列优化，通过后台定时任务+CountDownLatch方式将同步优化为异步、文件预热、jna锁定物理页，MappedFile之外通过堆外内存异步更新数据、后台线程异步更新Index,ConsumeQueue等方式提升读写性能，对存储部分的优化做了很深入的设计与实现。
 
 ## <a id="References">References</a>
 
