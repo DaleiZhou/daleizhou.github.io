@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka事务消息过程分析(一)
 excerpt_separator: <!--more-->
 ---

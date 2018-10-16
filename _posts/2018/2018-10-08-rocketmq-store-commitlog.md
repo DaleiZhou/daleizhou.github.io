@@ -1,6 +1,6 @@
 ---
 layout: post
-category: RocketMQ
+category: [RocketMQ, Source Code]
 title: RocketMQ存储实现分析
 excerpt_separator: <!--more-->
 ---

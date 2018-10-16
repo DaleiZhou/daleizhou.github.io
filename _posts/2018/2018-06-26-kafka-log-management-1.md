@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka Log Management(一)
 excerpt_separator: <!--more-->
 ---

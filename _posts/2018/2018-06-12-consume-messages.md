@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka Consumer(二)
 excerpt_separator: <!--more-->
 ---

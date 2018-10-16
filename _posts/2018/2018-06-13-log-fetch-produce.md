@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka log的读写分析
 excerpt_separator: <!--more-->
 ---

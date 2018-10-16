@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka Log Compaction
 excerpt_separator: <!--more-->
 ---

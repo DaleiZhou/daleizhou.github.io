@@ -1,6 +1,6 @@
 ---
 layout: post
-category: Kafka
+category: [Kafka, Source Code]
 title: Kafka 副本间的主从同步
 excerpt_separator: <!--more-->
 ---

@@ -1,13 +1,13 @@
 ---
 layout: post
-category: Coding
+category: [Coding, POJ]
 title: POJ2479 Maximum sum
 excerpt_separator: <!--more-->
 ---
 
 
 ## 内容 
->Status: Draft
+>Status: Release
 
 　　今天做一道入门级DP的题，出自[POJ2479](http://poj.org/problem?id=2479)
 <!--more-->
@@ -52,6 +52,8 @@ $$\max \limits_{1\leq s_{1} \leq t_{1} < s_{2} \leq t_{2} \leq n } \{ \sum_{i=s_
 </div>
 
 　　在这个基础上再看POJ2479就很简单了，利用分治的思路，位置i将原数组切割成左右两个数组，在左右两个数组分别求上述基础题的结果，左右两边结果加起来即为d(A)_i。实际实现过程中，维护两个数组max_l和max_r, 里面的元素分别以位置i为分割点得到的左右两个数组最大连续子数组和，遍历i可以遍历所有可能。最后再遍历一遍i从1到n-1,求 result = max(result, max_l[i-1], max_r[i]), 遍历结束result即为最终结果。
+
+　　题目还可以延伸的更难一点，那就是求多段连续字段最大和，这里就不再展开，直接看本题的代码实现吧。
 
 ## <a id="AC Code">AC Code</a> 
 

@@ -1,6 +1,6 @@
 ---
 layout: post
-category: RocketMQ
+category: [RocketMQ, Source Code]
 title: RocketMQ事务消息分析
 excerpt_separator: <!--more-->
 ---

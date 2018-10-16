@@ -1,13 +1,13 @@
 ---
 layout: post
-category: Coding
+category: [Coding, POJ]
 title: POJ1325 Machine Schedule
 excerpt_separator: <!--more-->
 ---
 
 
 ## 内容 
->Status: Draft
+>Status: Release
 
 　　数据结构与算法部分已经久未练习业已生疏，在业余时间带着刷一些题将技能捡起来。这个系列从[Poj1325[1]](http://poj.org/problem?id=1325)开始吧。
 <!--more-->
