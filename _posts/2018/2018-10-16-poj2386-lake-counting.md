@@ -1,7 +1,7 @@
 ---
 layout: post
 category: [Coding, POJ]
-title: POJ 2386 Lake Counting
+title: POJ2386 Lake Counting
 excerpt_separator: <!--more-->
 ---
 

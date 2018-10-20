@@ -16,8 +16,8 @@ excerpt_separator: <!--more-->
 
 * [POJ 1852 Ants](poj1852-ants.html)
 * [POJ 2386 Lake Counting](poj2386-lake-counting.html)
-* POJ 3617 Best Cow Line
-* POJ 3069 Saruman's Army
+* [POJ 3617 Best Cow Line](poj3617-best-cow-line.html)
+* [POJ 3069 Saruman's Army](poj3069-saruman's-army.html)
 * POJ 3253 Fence Repair
 * POJ 2431 Expedition
 * POJ 1182 食物链

@@ -86,21 +86,16 @@ excerpt_separator: <!--more-->
     }
 ```
 
-　　在NettyRemotingServer构造方法中，初始化了NettyRemotingAbstract,设置并发参数等，并实例化了几个EventLoop用于Netty处理客户端连接或读写事件的请求。当服务端要监听本地端口，则将NioServerSocketChannel注册到BossGroupEventLoop来处理Accept请求时，而已经Accept的SocketChannel会被注册到EventLoopGroupSelector用于处理读写事件。BrokerController.start()被调用时会调用NettyRemotingServer.start()方法，用于启动NettyRemotingServer。
+　　在NettyRemotingServer构造方法中，初始化了NettyRemotingAbstract,设置并发参数等，并实例化了几个EventLoop用于Netty处理客户端连接或读写事件的请求。当服务端要监听本地端口，则将NioServerSocketChannel注册到BossGroupEventLoop来处理Accept请求时，而已经Accept的SocketChannel会被注册到EventLoopGroupSelector用于处理读写事件。BrokerController.start()被调用时会调用NettyRemotingServer.start()方法，用于启动NettyRemotingServer。下面看start()方法具体细节。
 
 ```java
     // NettyRemotingServer.java
     public void start() {
+        // 处理耗时任务的线程池
         this.defaultEventExecutorGroup = new DefaultEventExecutorGroup(
             nettyServerConfig.getServerWorkerThreads(),
             new ThreadFactory() {
-
-                private AtomicInteger threadIndex = new AtomicInteger(0);
-
-                @Override
-                public Thread newThread(Runnable r) {
-                    return new Thread(r, "NettyServerCodecThread_" + this.threadIndex.incrementAndGet());
-                }
+                // more code ...
             });
 
         ServerBootstrap childHandler =
@@ -134,6 +129,7 @@ excerpt_separator: <!--more-->
         }
 
         try {
+            //Netty里是异步的世界，通过Feature同步等待bind结果
             ChannelFuture sync = this.serverBootstrap.bind().sync();
             InetSocketAddress addr = (InetSocketAddress) sync.channel().localAddress();
             this.port = addr.getPort();
@@ -145,16 +141,68 @@ excerpt_separator: <!--more-->
             this.nettyEventExecutor.start();
         }
 
+        // 定时任务扫描清理过期的请求
         this.timer.scheduleAtFixedRate(new TimerTask() {
-
-            @Override
-            public void run() {
-                try {
-                    NettyRemotingServer.this.scanResponseTable();
-                } catch (Throwable e) {
-                    log.error("scanResponseTable exception", e);
-                }
-            }
+            // more code...
         }, 1000 * 3, 1000);
     }
 ```
+
+　　这段方法是使用Netty的一般姿势。在配置好各种线程池之后进行bind端口，用于监听接受客户端连接请求，进而提供服务。这是使用Netty的基本套路，下面我们跟着请求从客户端到服务端返回到客户端看RocketMQ在Netty通信的具体实现。
+
+## <a id="Client">Client</a>
+
+　　我们从一个具体的例子看起，客户端通过MQClientAPIImpl.pullMessageSync去同步拉取消息调用如下，在默认实现的MQClientAPIImpl中会实例化有RemotingClient，负责具体的通信。
+
+```java
+    // MQClientAPIImpl.java
+    private PullResult pullMessageSync(
+        final String addr,
+        final RemotingCommand request,
+        final long timeoutMillis
+    ) throws RemotingException, InterruptedException, MQBrokerException {
+        RemotingCommand response = this.remotingClient.invokeSync(addr, request, timeoutMillis);
+        assert response != null;
+        return this.processPullResponse(response);
+    }
+```
+
+　　RemotingClient提供了三个调用远程方法的入口：`invokeAsync`,`invokeSync`,`invokeOneway`，分别是。
+```java
+    // RemotingClient.java
+    public interface RemotingClient extends RemotingService {
+
+    void updateNameServerAddressList(final List<String> addrs);
+
+    List<String> getNameServerAddressList();
+
+    RemotingCommand invokeSync(final String addr, final RemotingCommand request,
+        final long timeoutMillis) throws InterruptedException, RemotingConnectException,
+        RemotingSendRequestException, RemotingTimeoutException;
+
+    void invokeAsync(final String addr, final RemotingCommand request, final long timeoutMillis,
+        final InvokeCallback invokeCallback) throws InterruptedException, RemotingConnectException,
+        RemotingTooMuchRequestException, RemotingTimeoutException, RemotingSendRequestException;
+
+    void invokeOneway(final String addr, final RemotingCommand request, final long timeoutMillis)
+        throws InterruptedException, RemotingConnectException, RemotingTooMuchRequestException,
+        RemotingTimeoutException, RemotingSendRequestException;
+
+    void registerProcessor(final int requestCode, final NettyRequestProcessor processor,
+        final ExecutorService executor);
+
+    void setCallbackExecutor(final ExecutorService callbackExecutor);
+
+    ExecutorService getCallbackExecutor();
+
+    boolean isChannelWritable(final String addr);
+}
+```
+
+
+
+
+
+
+## <a id="References">References</a>
+
